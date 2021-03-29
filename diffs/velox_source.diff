@@ -591,7 +591,7 @@ index 0000000..b471a55
 +    }
 +}
 diff --git a/build/mcp_diff_src/net/minecraft/server/dedicated/DedicatedServer.java b/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
-index e1cb326..4015873 100644
+index e1cb326..aa72ace 100644
 --- a/build/mcp_diff_src/net/minecraft/server/dedicated/DedicatedServer.java
 +++ b/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
 @@ -97,7 +97,9 @@ public class DedicatedServer extends MinecraftServer implements IServer {
@@ -605,15 +605,18 @@ index e1cb326..4015873 100644
        if (Runtime.getRuntime().maxMemory() / 1024L / 1024L < 512L) {
           LOGGER.warn("To start the server with more ram, launch it as \"java -Xmx1024M -Xms1024M -jar minecraft_server.jar\"");
        }
-@@ -131,7 +133,7 @@ public class DedicatedServer extends MinecraftServer implements IServer {
+@@ -131,8 +133,9 @@ public class DedicatedServer extends MinecraftServer implements IServer {
        }
  
        this.func_244801_P();
 -      LOGGER.info("Starting Minecraft server on {}:{}", this.getServerHostname().isEmpty() ? "*" : this.getServerHostname(), this.getServerPort());
+-
++      // Velox start: Change start log 2
 +      LOGGER.info("Starting Velox server on {}:{}", this.getServerHostname().isEmpty() ? "*" : this.getServerHostname(), this.getServerPort());
- 
++      // Velox end
        try {
           this.getNetworkSystem().addEndpoint(inetaddress, this.getServerPort());
+       } catch (IOException ioexception) {
 diff --git a/build/mcp_diff_src/net/minecraft/world/World.java b/src/main/java/net/minecraft/world/World.java
 index a53a1a5..2b4a80b 100644
 --- a/build/mcp_diff_src/net/minecraft/world/World.java

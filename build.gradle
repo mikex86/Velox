@@ -65,7 +65,17 @@ jar {
         exclude '*.dll*', '*.so*', '*.dylib*', '*.csv', '*.jnilib'
         exclude '**/Log4j2Plugins.dat'
         exclude 'org/lwjgl/**'
-        exclude 'assets/**'
+        exclude 'assets/realms/**'
+
+        // Exclude all unnecessary minecraft assets not needed by the server
+        exclude 'assets/minecraft/gpu_warnlist.json'
+        exclude 'assets/minecraft/textures/**'
+        exclude 'assets/minecraft/texts/**'
+        exclude 'assets/minecraft/shaders/**'
+        exclude 'assets/minecraft/particles/**'
+        exclude 'assets/minecraft/models/**'
+        exclude 'assets/minecraft/font/**'
+        exclude 'assets/minecraft/blockstates/**'
         // Exclude all log4j configuration from libraries, the log4j configuration in resource will remain
         exclude 'log4j2.xml'
     }
