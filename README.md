@@ -1,7 +1,7 @@
-![Velox Server](https://github.com/mikex86/jarvis/blob/master/images/velox_logo.svg)
+![Velox Server](https://github.com/mikex86/Velox/blob/master/images/velox_logo.svg)
 
 # Velox Minecraft Server
-![Java CI with Gradle](https://github.com/mikex86/VeloxServer/workflows/Java%20CI%20with%20Gradle/badge.svg)
+![Java CI with Gradle](https://github.com/mikex86/Velox/workflows/Java%20CI%20with%20Gradle/badge.svg)
 ## About
 
 Velox primary goal is to improve performance of the Vanilla server.
@@ -13,7 +13,7 @@ of Minecraft.
 Velox may implement its own plugin/modding API in the future, but the primary focus right now
 is to maximize server performance.
 
-The project is in early development phase, but feel free to test the potentially unstable 
+The project is in early development, but feel free to test the potentially unstable 
 builds.
 
 
@@ -26,14 +26,14 @@ server performance for other players.
 ### Is this safe?
 Yesn't...<br>
 The region model makes the assumption, that entities in different regions do not interact with one
-another. In vanilla minecraft this should never happen. If you are aware of any edge case
+another. In vanilla Minecraft this should never happen. If you are aware of any edge case
 where this might occur, please do not hesitate to create an issue.
 
 ## Why drop support for the Bukkit API?
 
 As the Bukkit API was not created with this kind of ticking model in mind,
 it is likely that plugins might perform unsafe interactions, leaving no other option but to "hope for the best".
-Perhaps an even greater problem would be the thread safety measures for the plugin themselves.
+Perhaps an even greater problem would be the thread safety measures for the plugins themselves.
 Events like PlayerMoveEvent, which are invoked many times per second, might cause the server
 to synchronize for long enough to eliminate the gains of concurrency.
 
