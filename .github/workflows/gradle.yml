@@ -22,5 +22,5 @@ jobs:
       - name: Upload VeloxServer artifact
         uses: actions/upload-artifact@v2
         with:
-          name: VeloxServer-
+          name: VeloxServer
           path: build/libs/*.jar
