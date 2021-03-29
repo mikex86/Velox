@@ -1,0 +1,937 @@
+diff --git a/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java b/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java
+new file mode 100644
+index 0000000..2476d02
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java
+@@ -0,0 +1,72 @@
++package me.mikex86.velox.chunk;
++
++import java.util.concurrent.Executor;
++import java.util.function.Supplier;
++
++import javax.annotation.Nullable;
++
++import net.minecraft.world.server.ServerChunkProvider;
++import net.minecraft.world.server.ServerWorld;
++
++import com.mojang.datafixers.DataFixer;
++
++import net.minecraft.util.math.ChunkPos;
++import net.minecraft.world.chunk.Chunk;
++import net.minecraft.world.chunk.ChunkStatus;
++import net.minecraft.world.chunk.IChunk;
++import net.minecraft.world.chunk.listener.IChunkStatusListener;
++import net.minecraft.world.gen.ChunkGenerator;
++import net.minecraft.world.gen.feature.template.TemplateManager;
++import net.minecraft.world.storage.DimensionSavedDataManager;
++
++import net.minecraft.world.storage.SaveFormat.LevelSave;
++
++public class ConcurrentChunkProvider extends ServerChunkProvider {
++
++    public ConcurrentChunkProvider(ServerWorld worldIn, LevelSave worldDirectory, DataFixer dataFixer,
++                                   TemplateManager templateManagerIn, Executor executorIn, ChunkGenerator chunkGeneratorIn, int viewDistance,
++                                   boolean spawnHostiles, IChunkStatusListener p_i51537_8_, Supplier<DimensionSavedDataManager> p_i51537_9_) {
++        super(worldIn, worldDirectory, dataFixer, templateManagerIn, executorIn, chunkGeneratorIn, viewDistance, spawnHostiles, p_i51537_8_, p_i51537_9_);
++    }
++
++    @Override
++    @Nullable
++    public IChunk getChunk(int chunkX, int chunkZ, ChunkStatus requiredStatus, boolean load) {
++        long posLong = ChunkPos.asLong(chunkX, chunkZ);
++        IChunk chunk = lookupChunk(posLong);
++        if (chunk != null) {
++            return chunk;
++        }
++
++        synchronized (this) {
++            chunk = super.getChunk(chunkX, chunkZ, requiredStatus, load);
++        }
++
++        cacheChunk(posLong, chunk);
++        return chunk;
++    }
++
++    private IChunk lookupChunk(long posLong) {
++        return null;
++    }
++
++    @Override
++    @Nullable
++    public Chunk getChunkNow(int chunkX, int chunkZ) {
++        long posLong = ChunkPos.asLong(chunkX, chunkZ);
++
++        Chunk chunk = (Chunk) lookupChunk(posLong);
++        if (chunk != null) {
++            return chunk;
++        }
++
++        chunk = super.getChunkNow(chunkX, chunkZ);
++        cacheChunk(posLong, chunk);
++        return chunk;
++    }
++
++    private void cacheChunk(long posLong, IChunk chunk) {
++        // TODO: chunk caching
++    }
++
++}
+\ No newline at end of file
+diff --git a/src/main/java/me/mikex86/velox/region/ChunkLoadStatePrinter.java b/src/main/java/me/mikex86/velox/region/ChunkLoadStatePrinter.java
+new file mode 100644
+index 0000000..e5dff76
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/region/ChunkLoadStatePrinter.java
+@@ -0,0 +1,61 @@
++package me.mikex86.velox.region;
++
++import net.minecraft.util.math.ChunkPos;
++import net.minecraft.world.chunk.*;
++
++import javax.imageio.ImageIO;
++import java.awt.*;
++import java.awt.image.BufferedImage;
++import java.io.File;
++import java.io.IOException;
++
++/**
++ * A debug utility to print chunk load states onto an image saved in the folder "chunks_states".
++ */
++public class ChunkLoadStatePrinter {
++
++    public static void printChunkLoadState(TickRegionManager manager, Chunk currentlyUnloading) {
++        int xStart = -2000, zStart = -2000;
++        int xEnd = 2000, zEnd = 2000;
++        BufferedImage image = new BufferedImage(xEnd - xStart, zEnd - zStart, BufferedImage.TYPE_4BYTE_ABGR);
++        for (int x = xStart; x < xEnd; x++) {
++            for (int z = zStart; z < zEnd; z++) {
++
++                int rgb;
++                ChunkPos pos = currentlyUnloading.getPos();
++                if (pos.x == x && pos.z == z) {
++                    rgb = Color.MAGENTA.getRGB();
++                } else {
++                    Chunk chunk = manager.getChunk(x, z);
++                    if (chunk == null) {
++                        rgb = Color.BLACK.getRGB();
++                    } else {
++                        boolean loaded = chunk.isLoaded();
++                        if (loaded)
++                            rgb = Color.GREEN.getRGB();
++                        else
++                            rgb = Color.RED.getRGB();
++                    }
++                }
++                image.setRGB(x - xStart, z - zStart, rgb);
++            }
++        }
++        try {
++            ImageIO.write(image, "PNG", getNextFile());
++        } catch (IOException e) {
++            e.printStackTrace();
++        }
++    }
++
++    private static File getNextFile() {
++        File file;
++        int counter = 0;
++        do {
++            file = new File("chunk_states/state_" + counter + ".png");
++            file.getParentFile().mkdirs();
++            counter++;
++        } while (file.exists());
++        return file;
++    }
++
++}
+diff --git a/src/main/java/me/mikex86/velox/region/TickRegion.java b/src/main/java/me/mikex86/velox/region/TickRegion.java
+new file mode 100644
+index 0000000..0c18eb2
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/region/TickRegion.java
+@@ -0,0 +1,154 @@
++package me.mikex86.velox.region;
++
++import com.google.common.collect.Lists;
++import com.google.common.collect.Maps;
++import com.google.common.collect.Sets;
++import net.minecraft.entity.Entity;
++import net.minecraft.util.math.ChunkPos;
++import net.minecraft.world.chunk.Chunk;
++
++import java.util.*;
++import java.util.function.Consumer;
++
++public class TickRegion {
++
++    private final Map<ChunkPos, Chunk> chunkMap = Maps.newHashMap();
++    private final List<Entity> entityTickList = Lists.newArrayList();
++
++    public boolean addChunk(Chunk chunk) {
++        return this.chunkMap.put(chunk.getPos(), chunk) == null;
++    }
++
++    public boolean removeChunk(Chunk chunk) {
++        return this.chunkMap.remove(chunk.getPos()) != null;
++    }
++
++    public void clearEntityTickList() {
++        this.entityTickList.clear();
++    }
++
++    public void addToEntityTickList(Entity entity) {
++        this.entityTickList.add(entity);
++    }
++
++    public void applyTaskToEntityTickList(Consumer<Entity> entityTask) {
++        for (Entity entity : this.entityTickList) {
++            entityTask.accept(entity);
++        }
++    }
++
++    public boolean containsOrBorders(Chunk chunk) {
++        ChunkPos chunkPos = chunk.getPos();
++        for (Chunk regionChunk : this.chunkMap.values()) {
++            ChunkPos regionChunkPos = regionChunk.getPos();
++            int xDif = Math.abs(regionChunkPos.x - chunkPos.x);
++            int zDif = Math.abs(regionChunkPos.z - chunkPos.z);
++
++            // the distance can either be 0 or 1 on both xDif and zDif for "chunk" to either
++            // be at the same position as "regionChunkPos" or border it.
++            if (Math.max(xDif, zDif) <= 1) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    public boolean isEmpty() {
++        return this.chunkMap.isEmpty();
++    }
++
++    public void merge(TickRegion srcRegion) {
++        this.chunkMap.putAll(srcRegion.chunkMap);
++    }
++
++    @Override
++    public String toString() {
++        return "Region{" +
++                "numChunks=" + this.chunkMap.size() +
++                '}';
++    }
++
++    public Collection<Chunk> getChunks() {
++        return chunkMap.values();
++    }
++
++    List<Chunk> floodFillFromChunkUntilChunk(Chunk startChunk, Chunk endChunk) {
++        List<Chunk> floodFilledChunks = Lists.newArrayList();
++        Set<Chunk> visited = Sets.newHashSet();
++
++        Queue<Chunk> chunkFloodQueue = Lists.newLinkedList();
++        chunkFloodQueue.add(startChunk);
++
++        while (!chunkFloodQueue.isEmpty()) {
++            Chunk chunk = chunkFloodQueue.remove();
++            if (floodFilledChunks.contains(chunk))
++                System.err.println("Wuiuiui");
++            else
++                floodFilledChunks.add(chunk);
++
++            visited.add(chunk);
++            if (chunk == endChunk) {
++                break;
++            }
++            getNeighbors(false, chunkFloodQueue, visited, chunk);
++        }
++
++        return floodFilledChunks;
++    }
++
++//    List<Chunk> floodFillFromChunk(Chunk firstChunk) {
++//        List<Chunk> floodFilledChunks = Lists.newLinkedList();
++//
++//        Set<Chunk> chunkFloodSet = Sets.newHashSet();
++//        chunkFloodSet.add(firstChunk);
++//
++//        while (!chunkFloodSet.isEmpty()) {
++//            Chunk chunk = chunkFloodSet.iterator().next();
++//            floodFilledChunks.add(chunk);
++//            getNeighbors(chunkFloodSet, chunk);
++//        }
++//
++//        return floodFilledChunks;
++//    }
++
++    void getNeighbors(boolean addNulls, Collection<Chunk> dst, Collection<Chunk> visited, Chunk chunk) {
++        ChunkPos pos = chunk.getPos();
++        {
++            ChunkPos neighborPos = new ChunkPos(pos.x - 1, pos.z);
++            Chunk neighbor = this.chunkMap.get(neighborPos);
++            if (neighbor != null || addNulls) {
++                if (!visited.contains(neighbor) && !dst.contains(neighbor))
++                    dst.add(neighbor);
++            }
++        }
++        {
++            ChunkPos neighborPos = new ChunkPos(pos.x + 1, pos.z);
++            Chunk neighbor = this.chunkMap.get(neighborPos);
++            if (neighbor != null || addNulls) {
++                if (!visited.contains(neighbor) && !dst.contains(neighbor))
++                    dst.add(neighbor);
++            }
++        }
++        {
++            ChunkPos neighborPos = new ChunkPos(pos.x, pos.z - 1);
++            Chunk neighbor = this.chunkMap.get(neighborPos);
++            if (neighbor != null || addNulls) {
++                if (!visited.contains(neighbor) && !dst.contains(neighbor))
++                    dst.add(neighbor);
++            }
++        }
++        {
++            ChunkPos neighborPos = new ChunkPos(pos.x, pos.z + 1);
++            Chunk neighbor = this.chunkMap.get(neighborPos);
++            if (neighbor != null || addNulls) {
++                if (!visited.contains(neighbor) && !dst.contains(neighbor))
++                    dst.add(neighbor);
++            }
++        }
++    }
++
++    public Chunk getChunk(int blockX, int blockZ) {
++        ChunkPos chunkPos = new ChunkPos(blockX >> 4, blockZ >> 4);
++        return this.chunkMap.get(chunkPos);
++    }
++}
+diff --git a/src/main/java/me/mikex86/velox/region/TickRegionManager.java b/src/main/java/me/mikex86/velox/region/TickRegionManager.java
+new file mode 100644
+index 0000000..b471a55
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/region/TickRegionManager.java
+@@ -0,0 +1,280 @@
++package me.mikex86.velox.region;
++
++import com.google.common.collect.Lists;
++import com.google.common.collect.Maps;
++import net.minecraft.entity.Entity;
++import net.minecraft.util.math.BlockPos;
++import net.minecraft.util.math.ChunkPos;
++import net.minecraft.world.chunk.Chunk;
++import net.minecraft.world.server.ChunkManager;
++import net.minecraft.world.server.ServerChunkProvider;
++
++import java.util.*;
++import java.util.concurrent.*;
++import java.util.concurrent.locks.ReadWriteLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
++import java.util.function.Consumer;
++
++/**
++ * Creates and destroys regions when chunks are loaded/unloaded.
++ *
++ * Delegates tick list building and the scheduling of tasks on those tick lists to the individual regions.
++ */
++public class TickRegionManager {
++
++    private static final int nThreads = Runtime.getRuntime().availableProcessors();
++
++    // TODO: This is only static because multiple TickRegionManager instances can exist that should not have a service on their own claiming every core
++    // TODO: Config options
++    private static final ExecutorService service = new ThreadPoolExecutor(nThreads, nThreads,
++            0L, TimeUnit.MILLISECONDS,
++            new LinkedBlockingQueue<>(),
++            new ThreadFactory() {
++
++                private int nThreads = 0;
++
++                @Override
++                public Thread newThread(Runnable runnable) {
++                    Thread thread = new Thread(runnable, "TickWorker-" + nThreads);
++                    thread.setDaemon(true);
++                    nThreads++;
++                    return thread;
++                }
++            });
++
++    /**
++     * List containing all existing regions
++     */
++    private final List<TickRegion> regionList = Lists.newArrayList();
++
++    /**
++     * Maps the position of chunks to the TickRegion they are part of
++     */
++    private final Map<ChunkPos, TickRegion> tickRegionMap = Maps.newHashMap();
++
++    /**
++     * A lock to ensure thread safe access to the TickRegionManager state
++     */
++    private final ReadWriteLock lock = new ReentrantReadWriteLock();
++
++    /**
++     * Invoked when a chunk is either loaded or unloaded.
++     * The method will rebuild regions accordingly.
++     *
++     * @param chunk the chunk that is getting loaded/unloaded
++     * @param newLoadState the new load state of the chunk. true, if the chunk is getting loaded, false if the chunk is getting unloaded.
++     */
++    public void informChunkLoadStateChange(Chunk chunk, boolean newLoadState) {
++//        long start = System.currentTimeMillis();
++        this.lock.writeLock().lock();
++        try {
++            TickRegion chunkDstRegion = this.findRegion(chunk);
++            if (chunkDstRegion == null) {
++                chunkDstRegion = createRegion();
++            }
++            if (newLoadState) {
++                boolean modified = addChunkToRegion(chunkDstRegion, chunk);
++                if (!modified) {
++                    throw new IllegalStateException("Chunk was already contained in it's region before it was even loaded. This should never happen");
++                }
++                // Merge bordering regions:
++                // Checks if "chunk" borders any region that is not its current region.
++                // Removes the other region after adding its
++                // chunks to the region of "chunk"
++                for (Iterator<TickRegion> iterator = this.regionList.iterator(); iterator.hasNext(); ) {
++                    TickRegion region = iterator.next();
++                    if (region == chunkDstRegion) continue;
++                    if (region.containsOrBorders(chunk)) {
++                        mergeRegion(chunkDstRegion, region);
++                        iterator.remove();
++                    }
++                }
++            } else {
++                boolean modified = chunkDstRegion.removeChunk(chunk);
++                if (!modified) {
++                    throw new IllegalStateException("Chunk was already contained in it's region before it was even loaded. This should never happen");
++                }
++                if (chunkDstRegion.isEmpty()) {
++                    removeRegion(chunkDstRegion);
++                } else {
++                    checkRegionSplit(chunkDstRegion, chunk);
++                }
++            }
++        } finally {
++            this.lock.writeLock().unlock();
++        }
++//        long end = System.currentTimeMillis();
++//        System.out.println("informChunkLoadStateChange(" + newLoadState + ") took: " + (end - start) + " ms; " + this);
++    }
++
++    // not thread safe
++    private void checkRegionSplit(TickRegion region, Chunk unloadedChunk) {
++        ChunkManager chunkManager = ((ServerChunkProvider) unloadedChunk.getWorld().getChunkProvider()).chunkManager;
++        // Split the region if it is not continuous.
++        // Check for non continuity by checking if you can travel between
++        // the neighboring chunks of the chunk that has just been unloaded.
++        // We will create max. 4 regions in the worst case.
++
++        Collection<Chunk> allChunks = region.getChunks();
++
++        List<Chunk> neighbors = Lists.newArrayListWithCapacity(4);
++        region.getNeighbors(true, neighbors, Lists.newArrayList(), unloadedChunk);
++
++        assert neighbors.size() == 4;
++
++        for (int i = 0; i < neighbors.size() - 1; i++) {
++            Chunk neighbor1 = neighbors.get(i);
++            Chunk neighbor2 = neighbors.get(i + 1);
++            if (neighbor1 == null || neighbor2 == null)
++                continue;
++            List<Chunk> chunks = region.floodFillFromChunkUntilChunk(neighbor1, neighbor2);
++            Chunk lastChunk = chunks.get(chunks.size() - 1);
++            if (lastChunk != neighbor2) {
++                // we have not reached the neighboring chunk, the neighbors are in different regions
++                // if that is the case, "chunks" contains all chunks part of that region, because the flood fill didn't early stop.
++                if (!chunks.equals(allChunks)) {
++
++                    // Create new region with just the "chunks" list.
++                    // "chunks" may contain chunks that are pending unload.
++                    // In the worst case scenario, they are all pending unload, eg. on teleport.
++                    // In that case chunks will unload in basically random order resulting in catastrophically
++                    // high region complexity for the short time until those regions are deleted.
++                    // In that case, we don't want to even create a region, thus the initial null value of "newRegion".
++
++                    TickRegion newRegion = null;
++                    for (Chunk chunk : chunks) {
++                        if (chunkManager.chunksToUnload.containsKey(chunk.getPos().asLong())) {
++                            // Don't add this chunk to the new region, it is pending unload.
++                            // We are not yet removing it from the old region: When the chunk
++                            // is actually unloaded, #informChunkLoadStateChange will be invoked anyways.
++                            // Ticks might still be performed in those chunks. If we were to remove these from the region now,
++                            // these ticks could simply not be performed.
++                            continue;
++                        }
++                        // Create the region only then, when we know that at least one
++                        // chunk actually gets added to it.
++                        if (newRegion == null) {
++                            newRegion = createRegion();
++                        }
++                        newRegion.addChunk(chunk);
++                        region.removeChunk(chunk);
++                        if (region.isEmpty()) {
++                            removeRegion(region);
++                        }
++                        this.tickRegionMap.put(chunk.getPos(), newRegion);
++                    }
++                }
++            }
++        }
++    }
++
++    public void buildEntityTickList(Iterator<Entity> entityIt) {
++        this.lock.writeLock().lock();
++        try {
++            for (TickRegion region : this.regionList) {
++                region.clearEntityTickList();
++            }
++            while (entityIt.hasNext()) {
++                Entity entity = entityIt.next();
++                BlockPos bp = entity.getPosition();
++                TickRegion region = this.lookupRegion(bp.getX(), bp.getZ());
++                if (region == null) {
++                    // TODO: use a dummy region for these maybe existent edge cases?
++                    System.err.println("Could not find region for entity: " + entity);
++                } else {
++                    region.addToEntityTickList(entity);
++                }
++            }
++        } finally {
++            this.lock.writeLock().unlock();
++        }
++    }
++
++    public void applyEntityTask(Consumer<Entity> entityTask) {
++        this.lock.readLock().lock();
++        try {
++            List<TickRegion> regionList = Lists.newArrayList(this.regionList);
++            CountDownLatch latch = new CountDownLatch(regionList.size());
++            for (TickRegion region : regionList) {
++                service.submit(() -> {
++                    region.applyTaskToEntityTickList(entityTask);
++                    latch.countDown();
++                });
++            }
++            latch.await();
++        } catch (InterruptedException e) {
++            e.printStackTrace();
++        } finally {
++            this.lock.readLock().unlock();
++        }
++    }
++
++
++    // not thread safe
++    private TickRegion lookupRegion(int blockX, int blockZ) {
++        ChunkPos chunkPos = new ChunkPos(blockX >> 4, blockZ >> 4);
++        return this.tickRegionMap.get(chunkPos);
++    }
++
++    // not thread safe
++    private boolean addChunkToRegion(TickRegion region, Chunk chunk) {
++        this.tickRegionMap.put(chunk.getPos(), region);
++        return region.addChunk(chunk);
++    }
++
++    /**
++     * Merges the two regions.
++     *
++     * @param dstRegion the region to merge into
++     * @param srcRegion the region whose chunks should be merged into the other region
++     */
++    // not thread safe
++    private void mergeRegion(TickRegion dstRegion, TickRegion srcRegion) {
++        dstRegion.merge(srcRegion);
++        Collection<Chunk> chunks = srcRegion.getChunks();
++        for (Chunk chunk : chunks) {
++            this.tickRegionMap.put(chunk.getPos(), dstRegion);
++        }
++    }
++
++    // not thread safe
++    private void removeRegion(TickRegion region) {
++        Collection<Chunk> chunks = region.getChunks();
++        for (Chunk chunk : chunks) {
++            this.tickRegionMap.remove(chunk.getPos());
++        }
++        this.regionList.remove(region);
++    }
++
++    // not thread safe
++    private TickRegion createRegion() {
++        TickRegion region = new TickRegion();
++        this.regionList.add(region);
++        return region;
++    }
++
++    // not thread safe
++    private TickRegion findRegion(Chunk chunk) {
++        for (TickRegion region : this.regionList) {
++            if (region.containsOrBorders(chunk)) {
++                return region;
++            }
++        }
++        return null;
++    }
++
++    @Override
++    public String toString() {
++        return "RegionManager{" +
++                "numRegions=" + this.regionList.size() + ", " +
++                "regionList=" + this.regionList +
++                '}';
++    }
++
++    public Chunk getChunk(int x, int z) {
++        TickRegion region = this.lookupRegion(x, z);
++        if (region == null)
++            return null;
++        return region.getChunk(x, z);
++    }
++}
+diff --git a/build/mcp_diff_src/net/minecraft/server/dedicated/DedicatedServer.java b/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
+index e1cb326..4015873 100644
+--- a/build/mcp_diff_src/net/minecraft/server/dedicated/DedicatedServer.java
++++ b/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
+@@ -97,7 +97,9 @@ public class DedicatedServer extends MinecraftServer implements IServer {
+       thread.setDaemon(true);
+       thread.setUncaughtExceptionHandler(new DefaultUncaughtExceptionHandler(LOGGER));
+       thread.start();
+-      LOGGER.info("Starting minecraft server version " + SharedConstants.getVersion().getName());
++      // Velox start: Change start log
++      LOGGER.info("Starting Velox server version " + SharedConstants.getVersion().getName());
++      // Velox end
+       if (Runtime.getRuntime().maxMemory() / 1024L / 1024L < 512L) {
+          LOGGER.warn("To start the server with more ram, launch it as \"java -Xmx1024M -Xms1024M -jar minecraft_server.jar\"");
+       }
+@@ -131,7 +133,7 @@ public class DedicatedServer extends MinecraftServer implements IServer {
+       }
+ 
+       this.func_244801_P();
+-      LOGGER.info("Starting Minecraft server on {}:{}", this.getServerHostname().isEmpty() ? "*" : this.getServerHostname(), this.getServerPort());
++      LOGGER.info("Starting Velox server on {}:{}", this.getServerHostname().isEmpty() ? "*" : this.getServerHostname(), this.getServerPort());
+ 
+       try {
+          this.getNetworkSystem().addEndpoint(inetaddress, this.getServerPort());
+diff --git a/build/mcp_diff_src/net/minecraft/world/World.java b/src/main/java/net/minecraft/world/World.java
+index a53a1a5..2b4a80b 100644
+--- a/build/mcp_diff_src/net/minecraft/world/World.java
++++ b/src/main/java/net/minecraft/world/World.java
+@@ -11,6 +11,8 @@ import java.util.function.Consumer;
+ import java.util.function.Predicate;
+ import java.util.function.Supplier;
+ import javax.annotation.Nullable;
++
++import me.mikex86.velox.region.TickRegionManager;
+ import net.minecraft.block.AbstractFireBlock;
+ import net.minecraft.block.Block;
+ import net.minecraft.block.BlockState;
+@@ -93,6 +95,10 @@ public abstract class World implements IWorld, AutoCloseable {
+    private final BiomeManager biomeManager;
+    private final RegistryKey<World> dimension;
+ 
++   // Velox start: TickRegionManager instance per world
++   public final TickRegionManager tickRegionManager = new TickRegionManager();
++   // Velox end
++
+    protected World(ISpawnWorldInfo worldInfo, RegistryKey<World> dimension, final DimensionType dimensionType, Supplier<IProfiler> profiler, boolean isRemote, boolean isDebug, long seed) {
+       this.profiler = profiler;
+       this.worldInfo = worldInfo;
+diff --git a/build/mcp_diff_src/net/minecraft/world/chunk/Chunk.java b/src/main/java/net/minecraft/world/chunk/Chunk.java
+index a5ea695..c1ea124 100644
+--- a/build/mcp_diff_src/net/minecraft/world/chunk/Chunk.java
++++ b/src/main/java/net/minecraft/world/chunk/Chunk.java
+@@ -573,6 +573,7 @@ public class Chunk implements IChunk {
+    }
+ 
+    public void setLoaded(boolean loaded) {
++      this.world.tickRegionManager.informChunkLoadStateChange(this, loaded);
+       this.loaded = loaded;
+    }
+ 
+@@ -795,4 +796,10 @@ public class Chunk implements IChunk {
+       QUEUED,
+       CHECK;
+    }
++
++   // Velox start: Accessor for Chunk#loaded
++   public boolean isLoaded() {
++      return loaded;
++   }
++   // Velox end
+ }
+diff --git a/build/mcp_diff_src/net/minecraft/world/server/ChunkManager.java b/src/main/java/net/minecraft/world/server/ChunkManager.java
+index 7b0aa0e..03bfee9 100644
+--- a/build/mcp_diff_src/net/minecraft/world/server/ChunkManager.java
++++ b/src/main/java/net/minecraft/world/server/ChunkManager.java
+@@ -97,7 +97,9 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+    public static final int MAX_LOADED_LEVEL = 33 + ChunkStatus.maxDistance();
+    private final Long2ObjectLinkedOpenHashMap<ChunkHolder> loadedChunks = new Long2ObjectLinkedOpenHashMap<>();
+    private volatile Long2ObjectLinkedOpenHashMap<ChunkHolder> immutableLoadedChunks = this.loadedChunks.clone();
+-   private final Long2ObjectLinkedOpenHashMap<ChunkHolder> chunksToUnload = new Long2ObjectLinkedOpenHashMap<>();
++   // Velox start: Make ChunkManager#chunksToUnload public
++   public final Long2ObjectLinkedOpenHashMap<ChunkHolder> chunksToUnload = new Long2ObjectLinkedOpenHashMap<>();
++   // Velox end
+    private final LongSet loadedPositions = new LongOpenHashSet();
+    private final ServerWorld world;
+    private final ServerWorldLightManager lightManager;
+diff --git a/build/mcp_diff_src/net/minecraft/world/server/ServerChunkProvider.java b/src/main/java/net/minecraft/world/server/ServerChunkProvider.java
+index 41500e3..1d7cb04 100644
+--- a/build/mcp_diff_src/net/minecraft/world/server/ServerChunkProvider.java
++++ b/src/main/java/net/minecraft/world/server/ServerChunkProvider.java
+@@ -50,7 +50,9 @@ public class ServerChunkProvider extends AbstractChunkProvider {
+    private static final List<ChunkStatus> field_217239_c = ChunkStatus.getAll();
+    private final TicketManager ticketManager;
+    private final ChunkGenerator generator;
+-   private final ServerWorld world;
++   // Velox start: Make ServerChunkProvider#world protected
++   protected final ServerWorld world;
++   // Velox end
+    private final Thread mainThread;
+    private final ServerWorldLightManager lightManager;
+    private final ServerChunkProvider.ChunkExecutor executor;
+@@ -107,39 +109,35 @@ public class ServerChunkProvider extends AbstractChunkProvider {
+ 
+    @Nullable
+    public IChunk getChunk(int chunkX, int chunkZ, ChunkStatus requiredStatus, boolean load) {
+-      if (Thread.currentThread() != this.mainThread) {
+-         return CompletableFuture.supplyAsync(() -> {
+-            return this.getChunk(chunkX, chunkZ, requiredStatus, load);
+-         }, this.executor).join();
+-      } else {
+-         IProfiler iprofiler = this.world.getProfiler();
+-         iprofiler.func_230035_c_("getChunk");
+-         long i = ChunkPos.asLong(chunkX, chunkZ);
++      // Velox start: Remove getChunk mainThread check
++      IProfiler iprofiler = this.world.getProfiler();
++      iprofiler.func_230035_c_("getChunk");
++      long i = ChunkPos.asLong(chunkX, chunkZ);
+ 
+-         for(int j = 0; j < 4; ++j) {
+-            if (i == this.recentPositions[j] && requiredStatus == this.recentStatuses[j]) {
+-               IChunk ichunk = this.recentChunks[j];
+-               if (ichunk != null || !load) {
+-                  return ichunk;
+-               }
++      for(int j = 0; j < 4; ++j) {
++         if (i == this.recentPositions[j] && requiredStatus == this.recentStatuses[j]) {
++            IChunk ichunk = this.recentChunks[j];
++            if (ichunk != null || !load) {
++               return ichunk;
+             }
+          }
+-
+-         iprofiler.func_230035_c_("getChunkCacheMiss");
+-         CompletableFuture<Either<IChunk, ChunkHolder.IChunkLoadingError>> completablefuture = this.func_217233_c(chunkX, chunkZ, requiredStatus, load);
+-         this.executor.driveUntil(completablefuture::isDone);
+-         IChunk ichunk1 = completablefuture.join().map((p_222874_0_) -> {
+-            return p_222874_0_;
+-         }, (p_222870_1_) -> {
+-            if (load) {
+-               throw (IllegalStateException)Util.pauseDevMode(new IllegalStateException("Chunk not there when requested: " + p_222870_1_));
+-            } else {
+-               return null;
+-            }
+-         });
+-         this.func_225315_a(i, ichunk1, requiredStatus);
+-         return ichunk1;
+       }
++
++      iprofiler.func_230035_c_("getChunkCacheMiss");
++      CompletableFuture<Either<IChunk, ChunkHolder.IChunkLoadingError>> completablefuture = this.func_217233_c(chunkX, chunkZ, requiredStatus, load);
++      this.executor.driveUntil(completablefuture::isDone);
++      IChunk ichunk1 = completablefuture.join().map((p_222874_0_) -> {
++         return p_222874_0_;
++      }, (p_222870_1_) -> {
++        if (load) {
++            throw (IllegalStateException)Util.pauseDevMode(new IllegalStateException("Chunk not there when requested: " + p_222870_1_));
++         } else {
++            return null;
++         }
++      });
++      this.func_225315_a(i, ichunk1, requiredStatus);
++      return ichunk1;
++      // Velox end
+    }
+ 
+    @Nullable
+diff --git a/build/mcp_diff_src/net/minecraft/world/server/ServerWorld.java b/src/main/java/net/minecraft/world/server/ServerWorld.java
+index 4913be6..6bc7b91 100644
+--- a/build/mcp_diff_src/net/minecraft/world/server/ServerWorld.java
++++ b/src/main/java/net/minecraft/world/server/ServerWorld.java
+@@ -35,6 +35,8 @@ import java.util.stream.Collectors;
+ import java.util.stream.Stream;
+ import javax.annotation.Nonnull;
+ import javax.annotation.Nullable;
++
++import me.mikex86.velox.chunk.ConcurrentChunkProvider;
+ import net.minecraft.block.Block;
+ import net.minecraft.block.BlockEventData;
+ import net.minecraft.block.BlockState;
+@@ -180,9 +182,11 @@ public class ServerWorld extends World implements ISeedReader {
+       this.server = p_i241885_1_;
+       this.field_241104_N_ = p_i241885_12_;
+       this.field_241103_E_ = p_i241885_4_;
+-      this.field_241102_C_ = new ServerChunkProvider(this, p_i241885_3_, p_i241885_1_.getDataFixer(), p_i241885_1_.getTemplateManager(), p_i241885_2_, p_i241885_8_, p_i241885_1_.getPlayerList().getViewDistance(), p_i241885_1_.func_230540_aS_(), p_i241885_7_, () -> {
++      // Velox start: Use Concurrent Chunk Provider instead of ServerChunkProvider
++      this.field_241102_C_ = new ConcurrentChunkProvider(this, p_i241885_3_, p_i241885_1_.getDataFixer(), p_i241885_1_.getTemplateManager(), p_i241885_2_, p_i241885_8_, p_i241885_1_.getPlayerList().getViewDistance(), p_i241885_1_.func_230540_aS_(), p_i241885_7_, () -> {
+          return p_i241885_1_.func_241755_D_().getSavedData();
+       });
++      // Velox end
+       this.worldTeleporter = new Teleporter(this);
+       this.calculateInitialSkylight();
+       this.calculateInitialWeather();
+@@ -344,75 +348,101 @@ public class ServerWorld extends World implements ISeedReader {
+       }
+ 
+       if (flag3 || this.updateEntityTick++ < 300) {
+-         if (this.field_241105_O_ != null) {
+-            this.field_241105_O_.tick();
+-         }
+-
+-         this.tickingEntities = true;
+-         ObjectIterator<Entry<Entity>> objectiterator = this.entitiesById.int2ObjectEntrySet().iterator();
++         // Velox start: Call Velox tick entities method
++         this.tickEntitiesVelox();
++         // Velox end
++      }
+ 
+-         label164:
+-         while(true) {
+-            Entity entity1;
+-            while(true) {
+-               if (!objectiterator.hasNext()) {
+-                  this.tickingEntities = false;
++      iprofiler.endSection();
++   }
+ 
+-                  Entity entity;
+-                  while((entity = this.entitiesToAdd.poll()) != null) {
+-                     this.onEntityAdded(entity);
+-                  }
++   // Velox start: Velox tick entities method
++   private void tickEntitiesVelox() {
++      IProfiler profiler = this.getProfiler();
++      if (this.field_241105_O_ != null) {
++         this.field_241105_O_.tick();
++      }
+ 
+-                  this.tickBlockEntities();
+-                  break label164;
+-               }
++      this.tickingEntities = true;
+ 
+-               Entry<Entity> entry = objectiterator.next();
+-               entity1 = entry.getValue();
+-               Entity entity2 = entity1.getRidingEntity();
+-               if (!this.server.func_230537_U_() && (entity1 instanceof AnimalEntity || entity1 instanceof WaterMobEntity)) {
+-                  entity1.remove();
+-               }
+ 
+-               if (!this.server.func_230538_V_() && entity1 instanceof INPC) {
+-                  entity1.remove();
+-               }
++      // check entities for removal
++      {
++         Stream<Entry<Entity>> entityStream = this.entitiesById.int2ObjectEntrySet().stream();
++         entityStream.forEach(entry -> {
++            Entity entity = entry.getValue();
+ 
+-               iprofiler.startSection("checkDespawn");
+-               if (!entity1.removed) {
+-                  entity1.checkDespawn();
+-               }
++            // Marks all animals for removal, if spawning of animals is disabled
++            if (!this.server.func_230537_U_() && (entity instanceof AnimalEntity || entity instanceof WaterMobEntity)) {
++               entity.remove();
++            }
+ 
+-               iprofiler.endSection();
+-               if (entity2 == null) {
+-                  break;
+-               }
++            // Marks all NPCs for removal, if spawning of NPCs is disabled
++            if (!this.server.func_230538_V_() && entity instanceof INPC) {
++               entity.remove();
++            }
+ 
+-               if (entity2.removed || !entity2.isPassenger(entity1)) {
+-                  entity1.stopRiding();
+-                  break;
+-               }
++            profiler.startSection("checkDespawn");
++            // check if the entity should be de-spawned, if it isn't marked to get removed already
++            if (!entity.removed) {
++               entity.checkDespawn();
+             }
++            profiler.endSection();
+ 
+-            iprofiler.startSection("tick");
+-            if (!entity1.removed && !(entity1 instanceof EnderDragonPartEntity)) {
+-               this.guardEntityTick(this::updateEntity, entity1);
++            // riding entity of the entity marked for removal should stop riding remove-marked entity (if a riding entity is present)
++            Entity ridingEntity = entity.getRidingEntity();
++            if (ridingEntity != null && (ridingEntity.removed || !ridingEntity.isPassenger(entity))) {
++               entity.stopRiding();
+             }
++         });
++      }
++      // tick entities
++      {
++         // build tick list
++         this.tickRegionManager.buildEntityTickList(this.entitiesById.values().iterator());
+ 
+-            iprofiler.endSection();
+-            iprofiler.startSection("remove");
+-            if (entity1.removed) {
+-               this.removeFromChunk(entity1);
+-               objectiterator.remove();
+-               this.onEntityRemoved(entity1);
++         // tick entities
++         this.tickRegionManager.applyEntityTask(this::tickEntity);
++      }
++      // remove all entities marked for removal from the entity lists (server global, chunk local, invoke listeners etc...)
++      {
++         Stream<Entry<Entity>> entityStream = this.entitiesById.int2ObjectEntrySet().stream();
++         entityStream.forEach(entry -> {
++            Entity entity = entry.getValue();
++            profiler.startSection("remove");
++            if (entity.removed) {
++               this.removeFromChunk(entity);
++               this.onEntityRemoved(entity);
+             }
++            profiler.endSection();
++         });
++         this.entitiesById.int2ObjectEntrySet().removeIf(e -> e.getValue().removed);
++      }
++      this.tickingEntities = false;
+ 
+-            iprofiler.endSection();
++      // Add pending entities
++      {
++         Entity entity;
++         while ((entity = this.entitiesToAdd.poll()) != null) {
++            this.onEntityAdded(entity);
+          }
+       }
+ 
+-      iprofiler.endSection();
++      // tick block entities
++      this.tickBlockEntities();
++   }
++   // Velox end
++
++   // Velox start: individual entity tick method
++   private void tickEntity(Entity entity) {
++      IProfiler profiler = this.getProfiler();
++      profiler.startSection("tick");
++      if (!entity.removed && !(entity instanceof EnderDragonPartEntity)) {
++         this.guardEntityTick(this::updateEntity, entity);
++      }
++      profiler.endSection();
+    }
++   // Velox end
+ 
+    protected void func_241126_b_() {
+       if (this.field_241107_Q_) {

@@ -1,0 +1,158 @@
+buildscript {
+    repositories {
+        mavenLocal()
+        maven { url = 'http://files.minecraftforge.net/maven' }
+        jcenter()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'net.minecraftforge.gradle:ForgeGradle:3.0.+'
+    }
+}
+
+apply plugin: 'eclipse'
+apply plugin: 'net.minecraftforge.gradle.forgedev.patcher'
+
+configurations {
+    shade
+    compile.extendsFrom shade
+}
+
+group = 'me.mikex86'
+version = '1.0.0-alpha'
+
+ext {
+    minecraft_version = '1.16.5'
+    mcp_version = '20210115.111550'
+    mappings_channel = 'snapshot'
+    mappings_version = '20201028-1.16.3'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    shade 'net.minecraftforge:forgespi:3.0.+'
+}
+
+project(':mcp') {
+    apply plugin: 'net.minecraftforge.gradle.forgedev.mcp'
+    mcp {
+        config = minecraft_version + '-' + mcp_version
+        pipeline = 'joined'
+    }
+}
+
+evaluationDependsOn(':mcp')
+
+patcher {
+    parent = project(':mcp')
+    patchedSrc = file('src/main/java')
+    mappings channel: mappings_channel, version: mappings_version
+    mcVersion = minecraft_version
+}
+
+jar {
+    manifest {
+        attributes(
+                'Main-Class': 'net.minecraft.server.Main',
+                'Multi-Release': 'true'
+        )
+    }
+    from { configurations.runtimeClasspath.collect { file -> file.isDirectory() ? file : zipTree(file) } } {
+        exclude 'META-INF/MOJANG*'
+        exclude '*.dll*', '*.so*', '*.dylib*', '*.csv', '*.jnilib'
+        exclude '**/Log4j2Plugins.dat'
+        exclude 'org/lwjgl/**'
+        exclude 'assets/**'
+        // Exclude all log4j configuration from libraries, the log4j configuration in resource will remain
+        exclude 'log4j2.xml'
+    }
+}
+
+task runclient(type: JavaExec) {
+    group = "MCP"
+    description = "Runs the client"
+    classpath sourceSets.main.runtimeClasspath
+    if (System.getProperty("os.name").toLowerCase().contains("mac")) {
+        jvmArgs '-XstartOnFirstThread'
+    }
+    args '--gameDir', '.'
+    args '--version', minecraft_version
+    args '--assetsDir', downloadAssets.output
+    args '--assetIndex', "1.16"
+    args '--accessToken', '0'
+    main 'net.minecraft.client.main.Main'
+    workingDir 'run'
+}
+
+task createDiffs() {
+    doFirst {
+        mkdir 'diffs'
+        def process = Runtime.getRuntime().exec("git diff --no-index build/mcp_diff_src/ src/main/java/ --output diffs/velox_source.diff")
+        process.waitFor()
+    }
+}
+
+task applyDiffs() {
+    doFirst {
+        copy {
+            from 'build/mcp_diff_src'
+            into 'build/mcp_diff_clean_src'
+        }
+        def diffs = file("diffs").listFiles()
+        diffs.each { diff ->
+            def process = Runtime.getRuntime().exec("git apply \"${diff.path}\"")
+            process.waitFor()
+        }
+        delete 'build/mcp_diff_src'
+        copy {
+            from 'build/mcp_diff_clean_src'
+            into 'build/mcp_diff_src'
+        }
+        delete 'build/mcp_diff_clean_src'
+    }
+}
+
+
+task setup() {
+    group = "MCP"
+    description = "Setups the dev workspace"
+    dependsOn ':extractMapped'
+    doLast {
+        mkdir 'run/assets'
+        copy {
+            from downloadAssets.output.path
+            into 'run/assets'
+        }
+        mkdir 'build/mcp_diff_src'
+        copy {
+            from 'src/main/java'
+            into 'build/mcp_diff_src'
+        }
+    }
+}
+
+task copyAssets {
+    group = "MCP"
+    description = "Download and place the assets into the run folder"
+    dependsOn ':downloadAssets'
+    mkdir 'run/assets'
+    copy {
+        from downloadAssets.output.path
+        into 'run/assets'
+    }
+}
+
+task buildFinalJar {
+    dependsOn ordered(':setup', ':applyDiffs', ':build')
+}
+
+def ordered(String... dependencyPaths) {
+    def dependencies = dependencyPaths.collect { tasks.getByPath(it) }
+    for (int i = 0; i < dependencies.size() - 1; i++) {
+        dependencies[i + 1].mustRunAfter(dependencies[i])
+    }
+    return dependencies
+}
