@@ -68,20 +68,21 @@ index 0000000..7641dab
 +}
 diff --git a/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java b/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java
 new file mode 100644
-index 0000000..f83e2cf
+index 0000000..84b4b32
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,184 @@
 +package me.mikex86.velox.chunk;
 +
 +import java.util.concurrent.Executor;
 +import java.util.concurrent.TimeUnit;
 +import java.util.function.Supplier;
 +
-+import com.google.common.cache.Cache;
 +import com.google.common.cache.CacheBuilder;
++import me.mikex86.velox.utils.ArrayUtils;
 +import me.mikex86.velox.utils.PeriodicInvoker;
-+import me.mikex86.velox.utils.cache.LossyLongCache;
++import me.mikex86.velox.utils.cache.LossyLongChunkCache;
++import me.mikex86.velox.utils.cache.guava.AccessCountingCache;
 +import net.minecraft.util.math.ChunkPos;
 +import net.minecraft.world.chunk.Chunk;
 +import net.minecraft.world.server.ServerChunkProvider;
@@ -100,71 +101,134 @@ index 0000000..f83e2cf
 +
 +public class ConcurrentChunkProvider extends ServerChunkProvider {
 +
-+
 +    // TODO: MAKE CACHES CONFIGURABLE
++
 +    /**
 +     * A fast, lossy, l1 cache.
-+     * Cache turnover is rapid.
-+     * It's thread-safe, but it does not block when a write operation occurs. It resorts to missing.
-+     * Index collisions are also very likely to occur, in which case we just miss.
++     * Index collisions are fairly likely to occur, in which case we just miss.
 +     * Point is, this cache misses all the time.
 +     * Hash collisions are also not handled.
 +     * Good that the packed chunk pos long format does not produce these collisions.
 +     */
-+    private final LossyLongCache<IChunk> l1Cache = new LossyLongCache<>(256);
++    private final LossyLongChunkCache l1Cache = new LossyLongChunkCache(256);
 +
-+    private final Cache<Long, IChunk> l2Cache = CacheBuilder.newBuilder()
++    /**
++     * A bigger, slower (~ 10 times slower than L1), more sophisticated cache.
++     * (Still better than fallback, ~10 times slower than L2)
++     */
++    private final AccessCountingCache<Long, IChunk> l2Cache = AccessCountingCache.wrap(CacheBuilder.newBuilder()
 +            .maximumSize(2048)
-+            .expireAfterAccess(1, TimeUnit.MINUTES)
-+            .build();
-+
-+
-+    private final Thread cacheCleaner;
++            .expireAfterAccess(3, TimeUnit.MINUTES)
++            .build());
 +
 +    public ConcurrentChunkProvider(ServerWorld worldIn, LevelSave worldDirectory, DataFixer dataFixer,
 +                                   TemplateManager templateManagerIn, Executor executorIn, ChunkGenerator chunkGeneratorIn, int viewDistance,
 +                                   boolean spawnHostiles, IChunkStatusListener p_i51537_8_, Supplier<DimensionSavedDataManager> p_i51537_9_) {
 +        super(worldIn, worldDirectory, dataFixer, templateManagerIn, executorIn, chunkGeneratorIn, viewDistance, spawnHostiles, p_i51537_8_, p_i51537_9_);
-+        this.cacheCleaner = new Thread(new PeriodicInvoker(this.l2Cache::cleanUp, 1000, TimeUnit.MILLISECONDS), "ChunkCacheCleaner");
-+        this.cacheCleaner.setDaemon(true);
-+        this.cacheCleaner.start();
++        Thread cacheCleaner = new Thread(new PeriodicInvoker(this.l2Cache::cleanUp, 1000, TimeUnit.MILLISECONDS), "ChunkCacheCleaner");
++        cacheCleaner.setDaemon(true);
++        cacheCleaner.start();
++
++        Thread printStatsThread = new Thread(new PeriodicInvoker(this::printCacheStats, 20_000, TimeUnit.MILLISECONDS));
++        printStatsThread.setDaemon(true);
++        printStatsThread.start();
 +    }
++
++    private long l1Time;
++    private long l2Time;
++    private long l1Hits;
++    private long l2Hits;
++    private long l1Accesses;
++    private long l2Accesses;
++    private long fallbackAccesses;
++    private long nPostLookupsPerformed;
++    private long totalAccesses;
++    private long postLookupTime;
++    private long fallbackTime;
 +
 +    @Override
 +    protected IChunk lookupChunkCache(long packedChunkPos, ChunkStatus requiredStatus, boolean load) {
-+        IChunk chunk = this.l1Cache.get(packedChunkPos);
++        totalAccesses++;
++        IChunk chunk;
++        // Query L1 cache
++        {
++            long start = System.nanoTime();
++            chunk = this.l1Cache.get(packedChunkPos);
++            long end = System.nanoTime();
++            l1Time += (end - start);
++            l1Accesses++;
++            if (chunk != null)
++                l1Hits++;
++        }
++
 +        if (chunk == null) {
++            long start = System.nanoTime();
 +            chunk = this.l2Cache.getIfPresent(packedChunkPos);
++            long end = System.nanoTime();
++            l2Time += (end - start);
++            l2Accesses++;
++            if (chunk != null)
++                l2Hits++;
 +        }
++
 +        if (chunk == null) {
-+            return null;
++            return null; // All caches have missed
 +        }
++
++        long postLookupStart = System.nanoTime();
 +        // We don't want to somehow mix the status into the cache key
 +        // so we have to do this terribleness to miss if the required
 +        // status is not sufficient or the cached value a previous status
 +        // that is no longer valid.
 +        // These instances need to be GCd as fast as possible.
-+        // We therefore explicitly evict this instance from all caches.
++        // We therefore explicitly evict these instance from all caches
 +        if (!chunk.getStatus().isAtLeast(requiredStatus)) {
 +            return null;
 +        }
 +        if (requiredStatus == ChunkStatus.FULL && !(chunk instanceof Chunk)) {
-+            this.cacheEvict(packedChunkPos);
++            this.cacheEvict(packedChunkPos, chunk);
 +            return null;
 +        }
++        long postLookupEnd = System.nanoTime();
++        postLookupTime += (postLookupEnd - postLookupStart);
++        nPostLookupsPerformed++;
 +        return chunk;
 +    }
 +
-+    private void cacheEvict(long key) {
-+        this.l1Cache.put(key, null);
++    @Override
++    protected IChunk fallbackLookup(int chunkX, int chunkZ, ChunkStatus requiredStatus, boolean load) {
++        long start = System.nanoTime();
++        IChunk chunk = super.fallbackLookup(chunkX, chunkZ, requiredStatus, load);
++        long end = System.nanoTime();
++        fallbackTime += (end - start);
++        fallbackAccesses++;
++        return chunk;
++    }
++
++    private void cacheEvict(long key, IChunk chunk) {
++        this.l1Cache.invalidate(key, chunk);
 +        this.l2Cache.invalidate(key);
 +    }
++
++    private int populateCacheCalls = 0;
 +
 +    @Override
 +    protected void populateChunkCache(int chunkX, int chunkZ, IChunk chunk) {
 +        long key = ChunkPos.asLong(chunkX, chunkZ);
-+        this.l1Cache.put(key, chunk);
++
++        // Populate L2 cache
 +        this.l2Cache.put(key, chunk);
++
++        // Populate L1 cache with the most popular values of L2
++        // every 16 cache population calls
++        if (this.populateCacheCalls++ % 16 == 0) {
++            int capacity = this.l1Cache.getCapacity();
++            Long[] keysBoxed = new Long[capacity];
++            IChunk[] values = new IChunk[capacity];
++            this.l2Cache.retrieveMostAccessedValues(keysBoxed, values);
++            long[] keys = ArrayUtils.unbox(keysBoxed);
++            this.l1Cache.populate(keys, values);
++        }
 +    }
 +
 +    @Override
@@ -172,14 +236,33 @@ index 0000000..f83e2cf
 +        this.l1Cache.clear();
 +        this.l2Cache.invalidateAll();
 +    }
++
++    private void printCacheStats() {
++        if (totalAccesses == 0)
++            return;
++        synchronized (ConcurrentChunkProvider.class) {
++            System.out.println(this.world.getProviderName());
++            System.out.println("---------------------------------------------");
++            System.out.println(String.format("L1 hit rate: %.2f%%", (this.l1Hits / (double) this.totalAccesses) * 100));
++            System.out.println(String.format("L2 hit rate: %.2f%%", (this.l2Hits / (double) this.totalAccesses) * 100));
++            System.out.println(String.format("Fallback rate: %.2f%%", (this.fallbackAccesses / (double) this.totalAccesses) * 100));
++            System.out.println("---------------------------------------------");
++            System.out.println(String.format("L1 avg access time: %.2f ns", (this.l1Time / (double) this.l1Accesses)));
++            System.out.println(String.format("L2 avg access time: %.2f ns", (this.l2Time / (double) this.l2Accesses)));
++            System.out.println(String.format("Post lookup avg time: %.2f ns", (this.postLookupTime / (double) this.nPostLookupsPerformed)));
++            System.out.println(String.format("Fallback avg access time: %.2f ns", (this.fallbackTime / (double) this.fallbackAccesses)));
++            System.out.println("---------------------------------------------");
++            System.out.flush();
++        }
++    }
 +}
 \ No newline at end of file
 diff --git a/src/main/java/me/mikex86/velox/tick/MadMaxTickManager.java b/src/main/java/me/mikex86/velox/tick/MadMaxTickManager.java
 new file mode 100644
-index 0000000..35e5931
+index 0000000..dcea303
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/tick/MadMaxTickManager.java
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,45 @@
 +package me.mikex86.velox.tick;
 +
 +import com.google.common.collect.Lists;
@@ -187,10 +270,10 @@ index 0000000..35e5931
 +import net.minecraft.entity.Entity;
 +
 +import java.util.Collection;
-+import java.util.List;
 +import java.util.concurrent.ExecutionException;
 +import java.util.concurrent.ExecutorService;
 +import java.util.concurrent.Executors;
++import java.util.concurrent.ThreadFactory;
 +import java.util.function.Consumer;
 +
 +/**
@@ -206,7 +289,15 @@ index 0000000..35e5931
 +    public static boolean MAD_MAX_MODE = false;
 +
 +    private static final int nThreads = Runtime.getRuntime().availableProcessors();
-+    private static final ExecutorService service = MAD_MAX_MODE ? Executors.newFixedThreadPool(nThreads) : null;
++    private static final ExecutorService service = MAD_MAX_MODE ? Executors.newFixedThreadPool(nThreads, new ThreadFactory() {
++        private int nThreads = 0;
++        @Override
++        public Thread newThread(Runnable runnable) {
++            Thread thread = new Thread(runnable, "MadMaxTickWorker-" + nThreads++);
++            thread.setDaemon(true);
++            return thread;
++        }
++    }) : null;
 +
 +    public static void tickMadMax(Collection<Entity> entities, Consumer<Entity> action) {
 +        entities = Lists.newArrayList(entities);
@@ -379,7 +470,7 @@ index 0000000..a900813
 +}
 diff --git a/src/main/java/me/mikex86/velox/tick/TickRegionManager.java b/src/main/java/me/mikex86/velox/tick/TickRegionManager.java
 new file mode 100644
-index 0000000..c3bcfb5
+index 0000000..30fdda3
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/tick/TickRegionManager.java
 @@ -0,0 +1,284 @@
@@ -489,7 +580,7 @@ index 0000000..c3bcfb5
 +            this.lock.writeLock().unlock();
 +        }
 +        long end = System.currentTimeMillis();
-+        System.out.println("informChunkLoadStateChange(" + newLoadState + ") took: " + (end - start) + " ms; " + this);
++//        System.out.println("informChunkLoadStateChange(" + newLoadState + ") took: " + (end - start) + " ms; " + this);
 +    }
 +
 +    // not thread safe
@@ -667,6 +758,35 @@ index 0000000..c3bcfb5
 +        return region.getChunk(x, z);
 +    }
 +}
+diff --git a/src/main/java/me/mikex86/velox/utils/ArrayUtils.java b/src/main/java/me/mikex86/velox/utils/ArrayUtils.java
+new file mode 100644
+index 0000000..e6fdbb6
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/utils/ArrayUtils.java
+@@ -0,0 +1,23 @@
++package me.mikex86.velox.utils;
++
++public class ArrayUtils {
++
++    public static int[] unbox(Integer[] boxed) {
++        int[] unboxed = new int[boxed.length];
++        for (int i = 0; i < boxed.length; i++) {
++            Integer integer = boxed[i];
++            unboxed[i] = integer == null ? 0 : integer;
++        }
++        return unboxed;
++    }
++
++    public static long[] unbox(Long[] boxed) {
++        long[] unboxed = new long[boxed.length];
++        for (int i = 0; i < boxed.length; i++) {
++            Long aLong = boxed[i];
++            unboxed[i] = aLong == null ? 0 : aLong;
++        }
++        return unboxed;
++    }
++
++}
 diff --git a/src/main/java/me/mikex86/velox/utils/IteratorUtils.java b/src/main/java/me/mikex86/velox/utils/IteratorUtils.java
 new file mode 100644
 index 0000000..bc77dd0
@@ -692,11 +812,13 @@ index 0000000..bc77dd0
 +}
 diff --git a/src/main/java/me/mikex86/velox/utils/MathUtils.java b/src/main/java/me/mikex86/velox/utils/MathUtils.java
 new file mode 100644
-index 0000000..fc68869
+index 0000000..c457e20
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/utils/MathUtils.java
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,28 @@
 +package me.mikex86.velox.utils;
++
++import static java.lang.Math.floorDiv;
 +
 +public class MathUtils {
 +
@@ -716,6 +838,10 @@ index 0000000..fc68869
 +        n |= n >> 16;
 +        n++;
 +        return n;
++    }
++
++    public static long floorMod(long x, long y) {
++        return x - floorDiv(x, y) * y;
 +    }
 +}
 diff --git a/src/main/java/me/mikex86/velox/utils/PeriodicInvoker.java b/src/main/java/me/mikex86/velox/utils/PeriodicInvoker.java
@@ -884,81 +1010,288 @@ index 0000000..73cb54c
 +        return (num + divisor - 1) / divisor;
 +    }
 +}
-diff --git a/src/main/java/me/mikex86/velox/utils/cache/LossyLongCache.java b/src/main/java/me/mikex86/velox/utils/cache/LossyLongCache.java
+diff --git a/src/main/java/me/mikex86/velox/utils/cache/LossyLongChunkCache.java b/src/main/java/me/mikex86/velox/utils/cache/LossyLongChunkCache.java
 new file mode 100644
-index 0000000..7962294
+index 0000000..7250cfe
 --- /dev/null
-+++ b/src/main/java/me/mikex86/velox/utils/cache/LossyLongCache.java
-@@ -0,0 +1,71 @@
++++ b/src/main/java/me/mikex86/velox/utils/cache/LossyLongChunkCache.java
+@@ -0,0 +1,129 @@
 +package me.mikex86.velox.utils.cache;
 +
 +import it.unimi.dsi.fastutil.HashCommon;
 +import me.mikex86.velox.utils.MathUtils;
++import net.minecraft.world.chunk.IChunk;
 +
 +import java.util.Arrays;
-+import java.util.concurrent.locks.ReadWriteLock;
-+import java.util.concurrent.locks.ReentrantReadWriteLock;
 +
 +/**
-+ * Implements a cache with a 64-bit key.
++ * Implements a chunk cache with a 64-bit key.
 + * Index collisions of hashes are fairly likely.
-+ * Misses when concurrently modified to avoid blocking the thread.
 + * Hash collisions are also not handled.
++ * Thread-safety is achieved via copy on write
 + */
-+public class LossyLongCache<T> {
++public class LossyLongChunkCache {
++
++    private final int capacity;
 +
 +    /**
 +     * Bit mask used to calculate the index from a key.
 +     */
 +    private final long mask;
 +
-+    private final long[] keys;
++    /**
++     * The state of the cache.
++     * This instance is swapped as a whole when the cache is mutated.
++     * This copy on write operation constitutes thread-safety
++     */
++    private CacheState cacheState;
 +
-+    private final T[] values;
-+
-+    private final ReadWriteLock lock = new ReentrantReadWriteLock();
++    private final Object mutex = new Object();
 +
 +    /**
 +     * @param capacity the capacity of the cache. Should be a power of two. Next biggest will be used
 +     */
-+    @SuppressWarnings("unchecked")
-+    public LossyLongCache(int capacity) {
++    public LossyLongChunkCache(int capacity) {
 +        capacity = MathUtils.npot(capacity);
++        this.capacity = capacity;
 +        this.mask = capacity - 1;
-+        this.keys = new long[capacity];
-+        this.values = (T[]) new Object[capacity]; // avoid recasting on access
++        this.cacheState = new CacheState();
 +    }
 +
-+    public T get(long key) {
-+        if (!this.lock.readLock().tryLock()) {
++    public IChunk get(long key) {
++        int index = this.index(key);
++        CacheState cacheState = this.cacheState;
++        if (cacheState.keys[index] != key) {
 +            return null;
 +        }
-+        int index = this.index(key);
-+        if (this.keys[index] != key) {
-+            this.lock.readLock().unlock();
-+            return null; // hash collision, we just miss
-+        }
-+        T value = this.values[index];
-+        this.lock.readLock().unlock();
++        IChunk value = cacheState.values[index];
++        cacheState.lossyAccessCounters[index]++; // Fuck thread safety here...
 +        return value;
 +    }
 +
-+    public void put(long key, T value) {
-+        int index = index(key);
-+        this.lock.writeLock().lock();
-+        this.keys[index] = index;
-+        this.values[index] = value;
-+        this.lock.writeLock().unlock();
-+    }
-+
 +    private int index(long key) {
-+        // use murmurHash3. We can use every bit of randomness to make this work
-+        return (int) (HashCommon.murmurHash3(key) & this.mask);
++        return (int) (HashCommon.mix(key) & this.mask);
 +    }
 +
 +    public void clear() {
-+        Arrays.fill(this.keys, 0);
-+        Arrays.fill(this.values, null);
++        this.cacheState = new CacheState();
++    }
++
++    public int getCapacity() {
++        return capacity;
++    }
++
++    public void populate(long[] keys, IChunk[] values) {
++        assert keys.length == capacity;
++        assert values.length == capacity;
++        synchronized (this.mutex) {
++            CacheState cacheState = new CacheState();
++            for (int i = 0; i < keys.length; i++) {
++                long key = keys[i];
++                if (key == 0) continue;
++                int index = this.index(key);
++                cacheState.keys[index] = key;
++                cacheState.values[index] = values[i];
++                cacheState.lossyAccessCounters[index] = 0;
++            }
++            this.cacheState = cacheState;
++        }
++    }
++
++    public void invalidate(long key, IChunk chunk) {
++        synchronized (this.mutex) {
++            int index = index(key);
++            CacheState cacheState = this.cacheState;
++            if (cacheState.values[index] == chunk) {
++                cacheState = cacheState.copy();
++                cacheState.keys[index] = 0;
++                cacheState.values[index] = null;
++                cacheState.lossyAccessCounters[index] = 0;
++                this.cacheState = cacheState;
++            }
++        }
++    }
++
++    private class CacheState {
++
++        /**
++         * Roughly keeps track of the number of accesses each chunk of the cache has.
++         * We ignore thread-safety. If the counter is slightly off, so be it.
++         */
++        private final long[] lossyAccessCounters;
++
++        private final long[] keys;
++
++        private final IChunk[] values;
++
++        public CacheState() {
++            this.lossyAccessCounters = new long[capacity];
++            this.keys = new long[capacity];
++            this.values = new IChunk[capacity];
++        }
++
++        public CacheState(long[] lossyAccessCounters, long[] keys, IChunk[] values) {
++            this.lossyAccessCounters = lossyAccessCounters;
++            this.keys = keys;
++            this.values = values;
++        }
++
++        public CacheState copy() {
++            return new CacheState(
++                    Arrays.copyOf(this.lossyAccessCounters, this.lossyAccessCounters.length),
++                    Arrays.copyOf(this.keys, this.keys.length),
++                    Arrays.copyOf(this.values, this.values.length)
++            );
++        }
++    }
++}
+diff --git a/src/main/java/me/mikex86/velox/utils/cache/guava/AccessCountingCache.java b/src/main/java/me/mikex86/velox/utils/cache/guava/AccessCountingCache.java
+new file mode 100644
+index 0000000..038e345
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/utils/cache/guava/AccessCountingCache.java
+@@ -0,0 +1,95 @@
++package me.mikex86.velox.utils.cache.guava;
++
++import com.google.common.cache.Cache;
++import com.google.common.cache.ForwardingCache;
++
++import javax.annotation.Nullable;
++import java.util.Collections;
++import java.util.Locale;
++import java.util.Map;
++import java.util.WeakHashMap;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.locks.ReadWriteLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
++
++public class AccessCountingCache<K, V> extends ForwardingCache<K, V> {
++
++    private final Cache<K, V> delegate;
++    private final Map<Object, AtomicInteger> accessCounts = new WeakHashMap<>();
++    private final ReadWriteLock lock = new ReentrantReadWriteLock();
++
++    public AccessCountingCache(Cache<K, V> delegate) {
++        this.delegate = delegate;
++    }
++
++    public static <K, V> AccessCountingCache<K, V> wrap(Cache<K, V> cache) {
++        return new AccessCountingCache<>(cache);
++    }
++
++    @Override
++    public V get(K key, Callable<? extends V> valueLoader) throws ExecutionException {
++        this.lock.readLock().lock();
++        AtomicInteger integer = this.accessCounts.get(key);
++        this.lock.readLock().unlock();
++        if (integer == null) {
++            integer = new AtomicInteger(0);
++            this.lock.writeLock().lock();
++            this.accessCounts.put(key, integer);
++            this.lock.writeLock().unlock();
++        }
++        integer.incrementAndGet();
++        return super.get(key, valueLoader);
++    }
++
++    @Nullable
++    @Override
++    public V getIfPresent(Object key) {
++        this.lock.readLock().lock();
++        AtomicInteger integer = this.accessCounts.get(key);
++        this.lock.readLock().unlock();
++        if (integer == null) {
++            integer = new AtomicInteger(0);
++            this.lock.writeLock().lock();
++            this.accessCounts.put(key, integer);
++            this.lock.writeLock().unlock();
++        }
++        integer.incrementAndGet();
++        return super.getIfPresent(key);
++    }
++
++    public void retrieveMostAccessedValues(K[] keys, V[] values) {
++        int nValues = keys.length;
++        int[] counters = new int[nValues];
++        for (Map.Entry<K, V> entry : this.delegate.asMap().entrySet()) {
++            K key = entry.getKey();
++            V value = entry.getValue();
++            this.lock.readLock().lock();
++            AtomicInteger atomicCounter = this.accessCounts.get(key);
++            this.lock.readLock().unlock();
++            int counter = atomicCounter == null ? 0 : atomicCounter.get();
++            for (int i = 0; i < nValues; i++) {
++                if (counter >= counters[i]) {
++                    // Move everything back by one
++                    for (int j = nValues - 2; j >= i; j--) {
++                        counters[j + 1] = counters[j];
++                        keys[j + 1] = keys[j];
++                        values[j + 1] = values[j];
++                    }
++                    counters[i] = counter;
++                    keys[i] = key;
++                    values[i] = value;
++                    break;
++                }
++            }
++        }
++        int x = 0;
++    }
++
++    @Override
++    protected Cache<K, V> delegate() {
++        return this.delegate;
++    }
++}
+diff --git a/src/main/java/me/mikex86/velox/utils/lock/AbstractLock.java b/src/main/java/me/mikex86/velox/utils/lock/AbstractLock.java
+new file mode 100644
+index 0000000..8931022
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/utils/lock/AbstractLock.java
+@@ -0,0 +1,42 @@
++package me.mikex86.velox.utils.lock;
++
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.locks.Condition;
++import java.util.concurrent.locks.Lock;
++
++public abstract class AbstractLock implements Lock {
++
++    @Override
++    public abstract void lock();
++
++    @Override
++    public void lockInterruptibly() {
++        lock();
++    }
++
++    @Override
++    public boolean tryLock() {
++        throw new UnsupportedOperationException("tryLock() not implemented");
++    }
++
++
++    @Override
++    public boolean tryLock(long time, TimeUnit unit) {
++        long nanos = unit.toNanos(time);
++        long start = System.nanoTime();
++        while (System.nanoTime() - start < nanos) {
++            if (tryLock()) {
++                return true;
++            }
++        }
++        return true;
++    }
++
++    @Override
++    public abstract void unlock();
++
++    @Override
++    public Condition newCondition() {
++        throw new UnsupportedOperationException("newCondition() not implemented");
 +    }
 +}
 diff --git a/src/main/java/me/mikex86/velox/utils/lock/DummyLock.java b/src/main/java/me/mikex86/velox/utils/lock/DummyLock.java
@@ -1212,6 +1545,31 @@ index 71dfac2..af686a6 100644
 +      // Velox end
     }
  }
+diff --git a/build/mcp_diff_src/net/minecraft/util/palette/PalettedContainer.java b/src/main/java/net/minecraft/util/palette/PalettedContainer.java
+index 7217e61..462ec3a 100644
+--- a/build/mcp_diff_src/net/minecraft/util/palette/PalettedContainer.java
++++ b/src/main/java/net/minecraft/util/palette/PalettedContainer.java
+@@ -35,17 +35,9 @@ public class PalettedContainer<T> implements IResizeCallback<T> {
+    private final ReentrantLock lock = new ReentrantLock();
+ 
+    public void lock() {
+-      if (this.lock.isLocked() && !this.lock.isHeldByCurrentThread()) {
+-         String s = Thread.getAllStackTraces().keySet().stream().filter(Objects::nonNull).map((p_210458_0_) -> {
+-            return p_210458_0_.getName() + ": \n\tat " + (String)Arrays.stream(p_210458_0_.getStackTrace()).map(Object::toString).collect(Collectors.joining("\n\tat "));
+-         }).collect(Collectors.joining("\n"));
+-         CrashReport crashreport = new CrashReport("Writing into PalettedContainer from multiple threads", new IllegalStateException());
+-         CrashReportCategory crashreportcategory = crashreport.makeCategory("Thread dumps");
+-         crashreportcategory.addDetail("Thread dumps", s);
+-         throw new ReportedException(crashreport);
+-      } else {
+-         this.lock.lock();
+-      }
++      // Velox start: Make PalettedContainer threadsafe
++      this.lock.lock();
++      // Velox end
+    }
+ 
+    public void unlock() {
 diff --git a/build/mcp_diff_src/net/minecraft/village/PointOfInterestManager.java b/src/main/java/net/minecraft/village/PointOfInterestManager.java
 index faed79c..bd97e9f 100644
 --- a/build/mcp_diff_src/net/minecraft/village/PointOfInterestManager.java
@@ -1626,10 +1984,15 @@ index faed79c..bd97e9f 100644
  
     final class DistanceGraph extends SectionDistanceGraph {
 diff --git a/build/mcp_diff_src/net/minecraft/world/World.java b/src/main/java/net/minecraft/world/World.java
-index a53a1a5..38672bc 100644
+index a53a1a5..c7f85fe 100644
 --- a/build/mcp_diff_src/net/minecraft/world/World.java
 +++ b/src/main/java/net/minecraft/world/World.java
-@@ -11,6 +11,8 @@ import java.util.function.Consumer;
+@@ -7,10 +7,13 @@ import java.util.Collection;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Random;
++import java.util.concurrent.CopyOnWriteArrayList;
+ import java.util.function.Consumer;
  import java.util.function.Predicate;
  import java.util.function.Supplier;
  import javax.annotation.Nullable;
@@ -1638,7 +2001,24 @@ index a53a1a5..38672bc 100644
  import net.minecraft.block.AbstractFireBlock;
  import net.minecraft.block.Block;
  import net.minecraft.block.BlockState;
-@@ -93,6 +95,10 @@ public abstract class World implements IWorld, AutoCloseable {
+@@ -70,10 +73,12 @@ public abstract class World implements IWorld, AutoCloseable {
+    public static final RegistryKey<World> THE_NETHER = RegistryKey.getOrCreateKey(Registry.WORLD_KEY, new ResourceLocation("the_nether"));
+    public static final RegistryKey<World> THE_END = RegistryKey.getOrCreateKey(Registry.WORLD_KEY, new ResourceLocation("the_end"));
+    private static final Direction[] FACING_VALUES = Direction.values();
+-   public final List<TileEntity> loadedTileEntityList = Lists.newArrayList();
+-   public final List<TileEntity> tickableTileEntities = Lists.newArrayList();
+-   protected final List<TileEntity> addedTileEntityList = Lists.newArrayList();
+-   protected final List<TileEntity> tileEntitiesToBeRemoved = Lists.newArrayList();
++   // Velox start: make tile entity lists threadsafe
++   public final List<TileEntity> loadedTileEntityList = new CopyOnWriteArrayList<>();
++   public final List<TileEntity> tickableTileEntities = new CopyOnWriteArrayList<>();
++   protected final List<TileEntity> addedTileEntityList = new CopyOnWriteArrayList<>();
++   protected final List<TileEntity> tileEntitiesToBeRemoved = new CopyOnWriteArrayList<>();
++   // Velox end
+    private final Thread mainThread;
+    private final boolean isDebug;
+    private int skylightSubtracted;
+@@ -93,6 +98,10 @@ public abstract class World implements IWorld, AutoCloseable {
     private final BiomeManager biomeManager;
     private final RegistryKey<World> dimension;
  
@@ -1649,6 +2029,18 @@ index a53a1a5..38672bc 100644
     protected World(ISpawnWorldInfo worldInfo, RegistryKey<World> dimension, final DimensionType dimensionType, Supplier<IProfiler> profiler, boolean isRemote, boolean isDebug, long seed) {
        this.profiler = profiler;
        this.worldInfo = worldInfo;
+@@ -527,9 +536,9 @@ public abstract class World implements IWorld, AutoCloseable {
+    public TileEntity getTileEntity(BlockPos pos) {
+       if (isOutsideBuildHeight(pos)) {
+          return null;
+-      } else if (!this.isRemote && Thread.currentThread() != this.mainThread) {
+-         return null;
++         // Velox start: remove getTileEntity mainThread check
+       } else {
++         // Velox end
+          TileEntity tileentity = null;
+          if (this.processingLoadedTiles) {
+             tileentity = this.getPendingTileEntityAt(pos);
 diff --git a/build/mcp_diff_src/net/minecraft/world/chunk/Chunk.java b/src/main/java/net/minecraft/world/chunk/Chunk.java
 index a5ea695..7d3fc9f 100644
 --- a/build/mcp_diff_src/net/minecraft/world/chunk/Chunk.java
@@ -2366,7 +2758,7 @@ index 7b0aa0e..cd33e5e 100644
  
        private int func_241091_a_(int p_241091_1_) {
 diff --git a/build/mcp_diff_src/net/minecraft/world/server/ServerChunkProvider.java b/src/main/java/net/minecraft/world/server/ServerChunkProvider.java
-index 41500e3..f23c38f 100644
+index 41500e3..38f967d 100644
 --- a/build/mcp_diff_src/net/minecraft/world/server/ServerChunkProvider.java
 +++ b/src/main/java/net/minecraft/world/server/ServerChunkProvider.java
 @@ -6,7 +6,6 @@ import com.mojang.datafixers.DataFixer;
@@ -2409,7 +2801,7 @@ index 41500e3..f23c38f 100644
     }
  
     public ServerWorldLightManager getLightManager() {
-@@ -93,97 +93,92 @@ public class ServerChunkProvider extends AbstractChunkProvider {
+@@ -93,97 +93,99 @@ public class ServerChunkProvider extends AbstractChunkProvider {
        return this.chunkManager.func_219174_c();
     }
  
@@ -2471,17 +2863,8 @@ index 41500e3..f23c38f 100644
 +      // Velox end
 +
 +      iprofiler.func_230035_c_("getChunkCacheMiss");
-+      CompletableFuture<Either<IChunk, ChunkHolder.IChunkLoadingError>> completablefuture = this.func_217233_c(chunkX, chunkZ, requiredStatus, load);
-+      this.executor.driveUntil(completablefuture::isDone);
-+      chunk = completablefuture.join().map((p_222874_0_) -> {
-+         return p_222874_0_;
-+      }, (p_222870_1_) -> {
-+        if (load) {
-+            throw (IllegalStateException)Util.pauseDevMode(new IllegalStateException("Chunk not there when requested: " + p_222870_1_));
-+         } else {
-+            return null;
-+         }
-+      });
++
++      chunk = this.fallbackLookup(chunkX, chunkZ, requiredStatus, load);
 +      // Velox start: Call populateChunkCache
 +      if (chunk != null)
 +         populateChunkCache(chunkX, chunkZ, chunk);
@@ -2489,6 +2872,22 @@ index 41500e3..f23c38f 100644
 +      return chunk;
 +      // Velox end
 +   }
++
++   // Velox start: create fallbackLookup which can be overridden to implement a chunk cache
++   protected IChunk fallbackLookup(int chunkX, int chunkZ, ChunkStatus requiredStatus, boolean load) {
++      CompletableFuture<Either<IChunk, ChunkHolder.IChunkLoadingError>> completablefuture = this.func_217233_c(chunkX, chunkZ, requiredStatus, load);
++      this.executor.driveUntil(completablefuture::isDone);
++      return completablefuture.join().map((p_222874_0_) -> {
++         return p_222874_0_;
++      }, (p_222870_1_) -> {
++         if (load) {
++            throw (IllegalStateException)Util.pauseDevMode(new IllegalStateException("Chunk not there when requested: " + p_222870_1_));
++         } else {
++            return null;
++         }
++      });
++   }
++   // Velox end
 +
 +   // Velox start: create lookupChunkCache which can be overridden to implement a chunk cache
 +   protected IChunk lookupChunkCache(long packedChunkPos, ChunkStatus requiredStatus, boolean load) {
