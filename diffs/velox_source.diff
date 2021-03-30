@@ -1,50 +1,12 @@
-diff --git a/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java b/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java
+diff --git a/src/main/java/me/mikex86/velox/chunk/ChunkLoadStatePrinter.java b/src/main/java/me/mikex86/velox/chunk/ChunkLoadStatePrinter.java
 new file mode 100644
-index 0000000..0c04cb8
+index 0000000..7641dab
 --- /dev/null
-+++ b/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java
-@@ -0,0 +1,32 @@
++++ b/src/main/java/me/mikex86/velox/chunk/ChunkLoadStatePrinter.java
+@@ -0,0 +1,62 @@
 +package me.mikex86.velox.chunk;
 +
-+import java.util.concurrent.Executor;
-+import java.util.function.Supplier;
-+
-+import javax.annotation.Nullable;
-+
-+import net.minecraft.world.server.ServerChunkProvider;
-+import net.minecraft.world.server.ServerWorld;
-+
-+import com.mojang.datafixers.DataFixer;
-+
-+import net.minecraft.util.math.ChunkPos;
-+import net.minecraft.world.chunk.Chunk;
-+import net.minecraft.world.chunk.ChunkStatus;
-+import net.minecraft.world.chunk.IChunk;
-+import net.minecraft.world.chunk.listener.IChunkStatusListener;
-+import net.minecraft.world.gen.ChunkGenerator;
-+import net.minecraft.world.gen.feature.template.TemplateManager;
-+import net.minecraft.world.storage.DimensionSavedDataManager;
-+
-+import net.minecraft.world.storage.SaveFormat.LevelSave;
-+
-+public class ConcurrentChunkProvider extends ServerChunkProvider {
-+
-+    public ConcurrentChunkProvider(ServerWorld worldIn, LevelSave worldDirectory, DataFixer dataFixer,
-+                                   TemplateManager templateManagerIn, Executor executorIn, ChunkGenerator chunkGeneratorIn, int viewDistance,
-+                                   boolean spawnHostiles, IChunkStatusListener p_i51537_8_, Supplier<DimensionSavedDataManager> p_i51537_9_) {
-+        super(worldIn, worldDirectory, dataFixer, templateManagerIn, executorIn, chunkGeneratorIn, viewDistance, spawnHostiles, p_i51537_8_, p_i51537_9_);
-+    }
-+
-+}
-\ No newline at end of file
-diff --git a/src/main/java/me/mikex86/velox/region/ChunkLoadStatePrinter.java b/src/main/java/me/mikex86/velox/region/ChunkLoadStatePrinter.java
-new file mode 100644
-index 0000000..e5dff76
---- /dev/null
-+++ b/src/main/java/me/mikex86/velox/region/ChunkLoadStatePrinter.java
-@@ -0,0 +1,61 @@
-+package me.mikex86.velox.region;
-+
++import me.mikex86.velox.tick.TickRegionManager;
 +import net.minecraft.util.math.ChunkPos;
 +import net.minecraft.world.chunk.*;
 +
@@ -104,13 +66,164 @@ index 0000000..e5dff76
 +    }
 +
 +}
-diff --git a/src/main/java/me/mikex86/velox/region/TickRegion.java b/src/main/java/me/mikex86/velox/region/TickRegion.java
+diff --git a/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java b/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java
 new file mode 100644
-index 0000000..0c18eb2
+index 0000000..f83e2cf
 --- /dev/null
-+++ b/src/main/java/me/mikex86/velox/region/TickRegion.java
++++ b/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java
+@@ -0,0 +1,101 @@
++package me.mikex86.velox.chunk;
++
++import java.util.concurrent.Executor;
++import java.util.concurrent.TimeUnit;
++import java.util.function.Supplier;
++
++import com.google.common.cache.Cache;
++import com.google.common.cache.CacheBuilder;
++import me.mikex86.velox.utils.PeriodicInvoker;
++import me.mikex86.velox.utils.cache.LossyLongCache;
++import net.minecraft.util.math.ChunkPos;
++import net.minecraft.world.chunk.Chunk;
++import net.minecraft.world.server.ServerChunkProvider;
++import net.minecraft.world.server.ServerWorld;
++
++import com.mojang.datafixers.DataFixer;
++
++import net.minecraft.world.chunk.ChunkStatus;
++import net.minecraft.world.chunk.IChunk;
++import net.minecraft.world.chunk.listener.IChunkStatusListener;
++import net.minecraft.world.gen.ChunkGenerator;
++import net.minecraft.world.gen.feature.template.TemplateManager;
++import net.minecraft.world.storage.DimensionSavedDataManager;
++
++import net.minecraft.world.storage.SaveFormat.LevelSave;
++
++public class ConcurrentChunkProvider extends ServerChunkProvider {
++
++
++    // TODO: MAKE CACHES CONFIGURABLE
++    /**
++     * A fast, lossy, l1 cache.
++     * Cache turnover is rapid.
++     * It's thread-safe, but it does not block when a write operation occurs. It resorts to missing.
++     * Index collisions are also very likely to occur, in which case we just miss.
++     * Point is, this cache misses all the time.
++     * Hash collisions are also not handled.
++     * Good that the packed chunk pos long format does not produce these collisions.
++     */
++    private final LossyLongCache<IChunk> l1Cache = new LossyLongCache<>(256);
++
++    private final Cache<Long, IChunk> l2Cache = CacheBuilder.newBuilder()
++            .maximumSize(2048)
++            .expireAfterAccess(1, TimeUnit.MINUTES)
++            .build();
++
++
++    private final Thread cacheCleaner;
++
++    public ConcurrentChunkProvider(ServerWorld worldIn, LevelSave worldDirectory, DataFixer dataFixer,
++                                   TemplateManager templateManagerIn, Executor executorIn, ChunkGenerator chunkGeneratorIn, int viewDistance,
++                                   boolean spawnHostiles, IChunkStatusListener p_i51537_8_, Supplier<DimensionSavedDataManager> p_i51537_9_) {
++        super(worldIn, worldDirectory, dataFixer, templateManagerIn, executorIn, chunkGeneratorIn, viewDistance, spawnHostiles, p_i51537_8_, p_i51537_9_);
++        this.cacheCleaner = new Thread(new PeriodicInvoker(this.l2Cache::cleanUp, 1000, TimeUnit.MILLISECONDS), "ChunkCacheCleaner");
++        this.cacheCleaner.setDaemon(true);
++        this.cacheCleaner.start();
++    }
++
++    @Override
++    protected IChunk lookupChunkCache(long packedChunkPos, ChunkStatus requiredStatus, boolean load) {
++        IChunk chunk = this.l1Cache.get(packedChunkPos);
++        if (chunk == null) {
++            chunk = this.l2Cache.getIfPresent(packedChunkPos);
++        }
++        if (chunk == null) {
++            return null;
++        }
++        // We don't want to somehow mix the status into the cache key
++        // so we have to do this terribleness to miss if the required
++        // status is not sufficient or the cached value a previous status
++        // that is no longer valid.
++        // These instances need to be GCd as fast as possible.
++        // We therefore explicitly evict this instance from all caches.
++        if (!chunk.getStatus().isAtLeast(requiredStatus)) {
++            return null;
++        }
++        if (requiredStatus == ChunkStatus.FULL && !(chunk instanceof Chunk)) {
++            this.cacheEvict(packedChunkPos);
++            return null;
++        }
++        return chunk;
++    }
++
++    private void cacheEvict(long key) {
++        this.l1Cache.put(key, null);
++        this.l2Cache.invalidate(key);
++    }
++
++    @Override
++    protected void populateChunkCache(int chunkX, int chunkZ, IChunk chunk) {
++        long key = ChunkPos.asLong(chunkX, chunkZ);
++        this.l1Cache.put(key, chunk);
++        this.l2Cache.put(key, chunk);
++    }
++
++    @Override
++    protected void invalidateCaches() {
++        this.l1Cache.clear();
++        this.l2Cache.invalidateAll();
++    }
++}
+\ No newline at end of file
+diff --git a/src/main/java/me/mikex86/velox/tick/MadMaxTickManager.java b/src/main/java/me/mikex86/velox/tick/MadMaxTickManager.java
+new file mode 100644
+index 0000000..35e5931
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/tick/MadMaxTickManager.java
+@@ -0,0 +1,37 @@
++package me.mikex86.velox.tick;
++
++import com.google.common.collect.Lists;
++import me.mikex86.velox.utils.Streamer;
++import net.minecraft.entity.Entity;
++
++import java.util.Collection;
++import java.util.List;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.function.Consumer;
++
++/**
++ * A tick model that provokes thread safety errors by just streaming all entities in optimal batch sizes on all cores.
++ * This is horrendously unsafe
++ */
++public class MadMaxTickManager {
++
++    /**
++     * Whether mad max mode is enabled
++     * Debug/Development feature only.
++     */
++    public static boolean MAD_MAX_MODE = false;
++
++    private static final int nThreads = Runtime.getRuntime().availableProcessors();
++    private static final ExecutorService service = MAD_MAX_MODE ? Executors.newFixedThreadPool(nThreads) : null;
++
++    public static void tickMadMax(Collection<Entity> entities, Consumer<Entity> action) {
++        entities = Lists.newArrayList(entities);
++        try {
++            Streamer.streamBatched(service, nThreads, entities, action);
++        } catch (InterruptedException | ExecutionException e) {
++            e.printStackTrace();
++        }
++    }
++}
+diff --git a/src/main/java/me/mikex86/velox/tick/TickRegion.java b/src/main/java/me/mikex86/velox/tick/TickRegion.java
+new file mode 100644
+index 0000000..a900813
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/tick/TickRegion.java
 @@ -0,0 +1,154 @@
-+package me.mikex86.velox.region;
++package me.mikex86.velox.tick;
 +
 +import com.google.common.collect.Lists;
 +import com.google.common.collect.Maps;
@@ -264,13 +377,13 @@ index 0000000..0c18eb2
 +        return this.chunkMap.get(chunkPos);
 +    }
 +}
-diff --git a/src/main/java/me/mikex86/velox/region/TickRegionManager.java b/src/main/java/me/mikex86/velox/region/TickRegionManager.java
+diff --git a/src/main/java/me/mikex86/velox/tick/TickRegionManager.java b/src/main/java/me/mikex86/velox/tick/TickRegionManager.java
 new file mode 100644
-index 0000000..de283a4
+index 0000000..c3bcfb5
 --- /dev/null
-+++ b/src/main/java/me/mikex86/velox/region/TickRegionManager.java
++++ b/src/main/java/me/mikex86/velox/tick/TickRegionManager.java
 @@ -0,0 +1,284 @@
-+package me.mikex86.velox.region;
++package me.mikex86.velox.tick;
 +
 +import com.google.common.collect.Lists;
 +import com.google.common.collect.Maps;
@@ -577,6 +690,68 @@ index 0000000..bc77dd0
 +    }
 +
 +}
+diff --git a/src/main/java/me/mikex86/velox/utils/MathUtils.java b/src/main/java/me/mikex86/velox/utils/MathUtils.java
+new file mode 100644
+index 0000000..fc68869
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/utils/MathUtils.java
+@@ -0,0 +1,22 @@
++package me.mikex86.velox.utils;
++
++public class MathUtils {
++
++    /**
++     * Uses crazy standford magic to round up to the next power of two.
++     * For zero, it will return back zero again. This is a small anomaly of the function
++     * for performance reasons.
++     * @param n a given number
++     * @return the next power of two after (or equal to) n
++     */
++    public static int npot(int n) {
++        n--;
++        n |= n >> 1;
++        n |= n >> 2;
++        n |= n >> 4;
++        n |= n >> 8;
++        n |= n >> 16;
++        n++;
++        return n;
++    }
++}
+diff --git a/src/main/java/me/mikex86/velox/utils/PeriodicInvoker.java b/src/main/java/me/mikex86/velox/utils/PeriodicInvoker.java
+new file mode 100644
+index 0000000..4b2fcc7
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/utils/PeriodicInvoker.java
+@@ -0,0 +1,28 @@
++package me.mikex86.velox.utils;
++
++import java.util.concurrent.TimeUnit;
++
++public class PeriodicInvoker implements Runnable {
++
++    private final Runnable runnable;
++    private final long time;
++    private final TimeUnit timeUnit;
++
++    public PeriodicInvoker(Runnable runnable, long time, TimeUnit timeUnit) {
++        this.runnable = runnable;
++        this.time = time;
++        this.timeUnit = timeUnit;
++    }
++
++    @Override
++    public void run() {
++        try {
++            while (true) {
++                this.runnable.run();
++                Thread.sleep(this.timeUnit.toMillis(this.time));
++            }
++        } catch (InterruptedException e) {
++            e.printStackTrace();
++        }
++    }
++}
 diff --git a/src/main/java/me/mikex86/velox/utils/StreamUtils.java b/src/main/java/me/mikex86/velox/utils/StreamUtils.java
 new file mode 100644
 index 0000000..1bbc2d6
@@ -592,6 +767,267 @@ index 0000000..1bbc2d6
 +
 +    public static <T> Stream<T> prefetch(Stream<T> stream) {
 +        return stream.collect(Collectors.toList()).stream();
++    }
++
++}
+diff --git a/src/main/java/me/mikex86/velox/utils/Streamer.java b/src/main/java/me/mikex86/velox/utils/Streamer.java
+new file mode 100644
+index 0000000..73cb54c
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/utils/Streamer.java
+@@ -0,0 +1,108 @@
++package me.mikex86.velox.utils;
++
++import java.util.*;
++import java.util.concurrent.*;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.function.Consumer;
++import java.util.function.Function;
++import java.util.stream.Stream;
++
++public class Streamer {
++
++    /**
++     * Applies a function to stream elements in batches and returns the results. This method does not mutate the stream! (how would it?)
++     *
++     * @param executor  the executor to run the functions async on
++     * @param stream    the stream to retrieve elements from
++     * @param function  the function to apply
++     * @param batchSize the size of a batch that should be processed as one completable future. The result can only be retrieved when all elements of a batch are applied
++     * @param <T>       the type of elements
++     * @param <R>       the output type of the apply function
++     * @return the futures of the batches
++     */
++    public static <T, R> List<CompletableFuture<List<R>>> applyAsync(Executor executor, Stream<T> stream, Function<T, R> function, int batchSize) {
++        List<List<T>> batches = getBatches(stream, batchSize);
++        List<CompletableFuture<List<R>>> futures = new ArrayList<>();
++        for (List<T> batch : batches) {
++            futures.add(CompletableFuture.supplyAsync(() -> {
++                List<R> results = new ArrayList<>();
++                for (T t : batch) {
++                    results.add(function.apply(t));
++                }
++                return results;
++            }, executor));
++        }
++        return futures;
++    }
++
++    /**
++     * Performs {@link #applyAsync(Executor, Stream, Function, int)} and waits for the futures to complete
++     *
++     * @throws ExecutionException   if the execution completed exceptionally
++     * @throws InterruptedException if the execution thread was interrupted
++     * @see #applyAsync(Executor, Stream, Function, int)
++     */
++    public static <T, R> void applyAsyncWait(Executor executor, Stream<T> stream, Function<T, R> function, int batchSize) throws ExecutionException, InterruptedException {
++        List<CompletableFuture<List<R>>> futures = applyAsync(executor, stream, function, batchSize);
++        for (CompletableFuture<List<R>> future : futures) {
++            future.get();
++        }
++    }
++
++    /**
++     * Splits a given stream into batches. The last batch may not be of size #batchSize
++     *
++     * @param stream    the stream to split
++     * @param batchSize number of elements of each batch
++     * @param <T>       the type of element
++     * @return the list of batches
++     */
++    public static <T> List<List<T>> getBatches(Stream<T> stream, int batchSize) {
++        AtomicInteger i = new AtomicInteger(0);
++        List<List<T>> batches = new ArrayList<>();
++        stream.forEachOrdered(e -> {
++            int ig = i.get();
++            int batchIndex = ig / batchSize;
++            if (batchIndex == batches.size()) {
++                batches.add(new ArrayList<>());
++            }
++            batches.get(batchIndex).add(e);
++            i.incrementAndGet();
++        });
++        return batches;
++    }
++
++    public static <T> void streamBatched(Executor executor, int nBatches, Collection<T> values, Consumer<T> consumer) throws InterruptedException, ExecutionException {
++        int batchSize = roundUp(values.size(), nBatches);
++        Iterator<T> iterator = values.iterator();
++        T[] batch = (T[]) new Object[batchSize];
++        int i = 0;
++        CountDownLatch entityLatch = new CountDownLatch(values.size());
++        AtomicBoolean earlyAbort = new AtomicBoolean(false);
++
++        while (iterator.hasNext()) {
++            T next = iterator.next();
++            batch[i] = next;
++            i++;
++            // if batch is fully filled or no next value is available (partial batch), schedule a task processing that batch
++            if (i == batchSize || !iterator.hasNext()) {
++                T[] batchCopy = Arrays.copyOf(batch, i);
++                executor.execute(() -> {
++                    for (T value : batchCopy) {
++                        if (!earlyAbort.get()) {
++                            consumer.accept(value);
++                        }
++                        entityLatch.countDown();
++                    }
++                });
++                i = 0;
++            }
++        }
++        entityLatch.await();
++    }
++
++    private static int roundUp(int num, int divisor) {
++        return (num + divisor - 1) / divisor;
++    }
++}
+diff --git a/src/main/java/me/mikex86/velox/utils/cache/LossyLongCache.java b/src/main/java/me/mikex86/velox/utils/cache/LossyLongCache.java
+new file mode 100644
+index 0000000..7962294
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/utils/cache/LossyLongCache.java
+@@ -0,0 +1,71 @@
++package me.mikex86.velox.utils.cache;
++
++import it.unimi.dsi.fastutil.HashCommon;
++import me.mikex86.velox.utils.MathUtils;
++
++import java.util.Arrays;
++import java.util.concurrent.locks.ReadWriteLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
++
++/**
++ * Implements a cache with a 64-bit key.
++ * Index collisions of hashes are fairly likely.
++ * Misses when concurrently modified to avoid blocking the thread.
++ * Hash collisions are also not handled.
++ */
++public class LossyLongCache<T> {
++
++    /**
++     * Bit mask used to calculate the index from a key.
++     */
++    private final long mask;
++
++    private final long[] keys;
++
++    private final T[] values;
++
++    private final ReadWriteLock lock = new ReentrantReadWriteLock();
++
++    /**
++     * @param capacity the capacity of the cache. Should be a power of two. Next biggest will be used
++     */
++    @SuppressWarnings("unchecked")
++    public LossyLongCache(int capacity) {
++        capacity = MathUtils.npot(capacity);
++        this.mask = capacity - 1;
++        this.keys = new long[capacity];
++        this.values = (T[]) new Object[capacity]; // avoid recasting on access
++    }
++
++    public T get(long key) {
++        if (!this.lock.readLock().tryLock()) {
++            return null;
++        }
++        int index = this.index(key);
++        if (this.keys[index] != key) {
++            this.lock.readLock().unlock();
++            return null; // hash collision, we just miss
++        }
++        T value = this.values[index];
++        this.lock.readLock().unlock();
++        return value;
++    }
++
++    public void put(long key, T value) {
++        int index = index(key);
++        this.lock.writeLock().lock();
++        this.keys[index] = index;
++        this.values[index] = value;
++        this.lock.writeLock().unlock();
++    }
++
++    private int index(long key) {
++        // use murmurHash3. We can use every bit of randomness to make this work
++        return (int) (HashCommon.murmurHash3(key) & this.mask);
++    }
++
++    public void clear() {
++        Arrays.fill(this.keys, 0);
++        Arrays.fill(this.values, null);
++    }
++}
+diff --git a/src/main/java/me/mikex86/velox/utils/lock/DummyLock.java b/src/main/java/me/mikex86/velox/utils/lock/DummyLock.java
+new file mode 100644
+index 0000000..1f35585
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/utils/lock/DummyLock.java
+@@ -0,0 +1,38 @@
++package me.mikex86.velox.utils.lock;
++
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.locks.Condition;
++import java.util.concurrent.locks.Lock;
++
++public class DummyLock implements Lock {
++
++    @Override
++    public void lock() {
++
++    }
++
++    @Override
++    public void lockInterruptibly() throws InterruptedException {
++
++    }
++
++    @Override
++    public boolean tryLock() {
++        return false;
++    }
++
++    @Override
++    public boolean tryLock(long time, TimeUnit unit) throws InterruptedException {
++        return false;
++    }
++
++    @Override
++    public void unlock() {
++
++    }
++
++    @Override
++    public Condition newCondition() {
++        return null;
++    }
++}
+diff --git a/src/main/java/me/mikex86/velox/utils/lock/DummyReadWriteLock.java b/src/main/java/me/mikex86/velox/utils/lock/DummyReadWriteLock.java
+new file mode 100644
+index 0000000..0f4225a
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/utils/lock/DummyReadWriteLock.java
+@@ -0,0 +1,20 @@
++package me.mikex86.velox.utils.lock;
++
++import java.util.concurrent.locks.Lock;
++import java.util.concurrent.locks.ReadWriteLock;
++
++public class DummyReadWriteLock implements ReadWriteLock {
++
++    private final Lock lock = new DummyLock();
++
++    @Override
++    public Lock readLock() {
++        return lock;
++    }
++
++    @Override
++    public Lock writeLock() {
++        return lock;
 +    }
 +
 +}
@@ -622,6 +1058,160 @@ index e1cb326..aa72ace 100644
        try {
           this.getNetworkSystem().addEndpoint(inetaddress, this.getServerPort());
        } catch (IOException ioexception) {
+diff --git a/build/mcp_diff_src/net/minecraft/util/ClassInheritanceMultiMap.java b/src/main/java/net/minecraft/util/ClassInheritanceMultiMap.java
+index 71dfac2..af686a6 100644
+--- a/build/mcp_diff_src/net/minecraft/util/ClassInheritanceMultiMap.java
++++ b/src/main/java/net/minecraft/util/ClassInheritanceMultiMap.java
+@@ -11,12 +11,19 @@ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Map.Entry;
++import java.util.concurrent.locks.Lock;
++import java.util.concurrent.locks.ReadWriteLock;
++import java.util.concurrent.locks.ReentrantLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
+ import java.util.stream.Collectors;
+ 
+ public class ClassInheritanceMultiMap<T> extends AbstractCollection<T> {
+    private final Map<Class<?>, List<T>> map = Maps.newHashMap();
+    private final Class<T> baseClass;
+    private final List<T> values = Lists.newArrayList();
++   // Velox start: ClassInheritanceMultiMap lock
++   private final ReadWriteLock lock = new ReentrantReadWriteLock();
++   // Velox end
+ 
+    public ClassInheritanceMultiMap(Class<T> baseClassIn) {
+       this.baseClass = baseClassIn;
+@@ -24,28 +31,40 @@ public class ClassInheritanceMultiMap<T> extends AbstractCollection<T> {
+    }
+ 
+    public boolean add(T p_add_1_) {
+-      boolean flag = false;
+-
+-      for(Entry<Class<?>, List<T>> entry : this.map.entrySet()) {
+-         if (entry.getKey().isInstance(p_add_1_)) {
+-            flag |= entry.getValue().add(p_add_1_);
++      // Velox start: ClassInheritanceMultiMap#add threadsafe
++      try {
++         this.lock.writeLock().lock();
++         boolean flag = false;
++         for (Entry<Class<?>, List<T>> entry : this.map.entrySet()) {
++            if (entry.getKey().isInstance(p_add_1_)) {
++               flag |= entry.getValue().add(p_add_1_);
++            }
+          }
++         return flag;
++      } finally {
++         this.lock.writeLock().unlock();
+       }
+-
+-      return flag;
++      // Velox end
+    }
+ 
+    public boolean remove(Object p_remove_1_) {
+-      boolean flag = false;
++      // Velox start: ClassInheritanceMultiMap#remove threadsafe
++      try {
++         this.lock.writeLock().lock();
++         boolean flag = false;
+ 
+-      for(Entry<Class<?>, List<T>> entry : this.map.entrySet()) {
+-         if (entry.getKey().isInstance(p_remove_1_)) {
+-            List<T> list = entry.getValue();
+-            flag |= list.remove(p_remove_1_);
++         for (Entry<Class<?>, List<T>> entry : this.map.entrySet()) {
++            if (entry.getKey().isInstance(p_remove_1_)) {
++               List<T> list = entry.getValue();
++               flag |= list.remove(p_remove_1_);
++            }
+          }
+-      }
+ 
+-      return flag;
++         return flag;
++      } finally {
++         this.lock.writeLock().unlock();
++      }
++      // Velox end
+    }
+ 
+    public boolean contains(Object p_contains_1_) {
+@@ -53,25 +72,64 @@ public class ClassInheritanceMultiMap<T> extends AbstractCollection<T> {
+    }
+ 
+    public <S> Collection<S> getByClass(Class<S> p_219790_1_) {
+-      if (!this.baseClass.isAssignableFrom(p_219790_1_)) {
+-         throw new IllegalArgumentException("Don't know how to search for " + p_219790_1_);
+-      } else {
+-         List<T> list = this.map.computeIfAbsent(p_219790_1_, (p_219791_1_) -> {
+-            return this.values.stream().filter(p_219791_1_::isInstance).collect(Collectors.toList());
+-         });
+-         return (Collection<S>) Collections.unmodifiableCollection(list);
++      // Velox start: ClassInheritanceMultiMap#getByClass threadsafe
++      try {
++         this.lock.writeLock().lock();
++         if (!this.baseClass.isAssignableFrom(p_219790_1_)) {
++            throw new IllegalArgumentException("Don't know how to search for " + p_219790_1_);
++         } else {
++            List<T> classList = this.map.get(p_219790_1_);
++            if (classList == null) {
++               classList = buildClassList(p_219790_1_);
++               this.map.put(p_219790_1_, classList);
++            }
++            return (Collection<S>) Lists.newArrayList(classList);
++         }
++      } finally {
++         this.lock.writeLock().unlock();
+       }
++      // Velox end
+    }
+ 
++   // Velox start: ClassInheritanceMultiMap#buildClassList
++   private <S> List<T> buildClassList(Class<S> clazz) {
++      List<T> values = this.func_241289_a_();
++      List<T> classList = Lists.newArrayList();
++      for (T value : values) {
++         if (clazz.isInstance(value)) {
++            classList.add(value);
++         }
++      }
++      return classList;
++   }
++   // Velox end
++
+    public Iterator<T> iterator() {
+-      return (Iterator<T>)(this.values.isEmpty() ? Collections.emptyIterator() : Iterators.unmodifiableIterator(this.values.iterator()));
++      // Velox start: ClassInheritanceMultiMap#iterator threadsafe
++      List<T> values = func_241289_a_();
++      return (Iterator<T>) (values.isEmpty() ? Collections.emptyIterator() : Iterators.unmodifiableIterator(values.iterator()));
++      // Velox end
+    }
+ 
+    public List<T> func_241289_a_() {
+-      return ImmutableList.copyOf(this.values);
++      // Velox start: ClassInheritanceMultiMap#func_241289_a_ threadsafe
++      try {
++         this.lock.readLock().lock();
++         return ImmutableList.copyOf(this.values);
++      } finally {
++         this.lock.readLock().unlock();
++      }
++      // Velox end
+    }
+ 
+    public int size() {
+-      return this.values.size();
++      // Velox start: ClassInheritanceMultiMap#size threadsafe
++      try {
++         this.lock.readLock().lock();
++         return this.values.size();
++      } finally {
++         this.lock.readLock().unlock();
++      }
++      // Velox end
+    }
+ }
 diff --git a/build/mcp_diff_src/net/minecraft/village/PointOfInterestManager.java b/src/main/java/net/minecraft/village/PointOfInterestManager.java
 index faed79c..bd97e9f 100644
 --- a/build/mcp_diff_src/net/minecraft/village/PointOfInterestManager.java
@@ -1036,7 +1626,7 @@ index faed79c..bd97e9f 100644
  
     final class DistanceGraph extends SectionDistanceGraph {
 diff --git a/build/mcp_diff_src/net/minecraft/world/World.java b/src/main/java/net/minecraft/world/World.java
-index a53a1a5..2b4a80b 100644
+index a53a1a5..38672bc 100644
 --- a/build/mcp_diff_src/net/minecraft/world/World.java
 +++ b/src/main/java/net/minecraft/world/World.java
 @@ -11,6 +11,8 @@ import java.util.function.Consumer;
@@ -1044,7 +1634,7 @@ index a53a1a5..2b4a80b 100644
  import java.util.function.Supplier;
  import javax.annotation.Nullable;
 +
-+import me.mikex86.velox.region.TickRegionManager;
++import me.mikex86.velox.tick.TickRegionManager;
  import net.minecraft.block.AbstractFireBlock;
  import net.minecraft.block.Block;
  import net.minecraft.block.BlockState;
@@ -1085,21 +1675,23 @@ index a5ea695..7d3fc9f 100644
 +   // Velox end
  }
 diff --git a/build/mcp_diff_src/net/minecraft/world/chunk/storage/RegionSectionCache.java b/src/main/java/net/minecraft/world/chunk/storage/RegionSectionCache.java
-index 61a0bd8..5263d1a 100644
+index 61a0bd8..50f7311 100644
 --- a/build/mcp_diff_src/net/minecraft/world/chunk/storage/RegionSectionCache.java
 +++ b/src/main/java/net/minecraft/world/chunk/storage/RegionSectionCache.java
-@@ -15,6 +15,10 @@ import java.io.File;
+@@ -15,9 +15,12 @@ import java.io.File;
  import java.io.IOException;
  import java.util.Map;
  import java.util.Optional;
 +import java.util.concurrent.locks.Lock;
-+import java.util.concurrent.locks.ReadWriteLock;
 +import java.util.concurrent.locks.ReentrantLock;
-+import java.util.concurrent.locks.ReentrantReadWriteLock;
  import java.util.function.BooleanSupplier;
  import java.util.function.Function;
  import javax.annotation.Nullable;
-@@ -39,6 +43,9 @@ public class RegionSectionCache<R> implements AutoCloseable {
++
+ import net.minecraft.nbt.CompoundNBT;
+ import net.minecraft.nbt.INBT;
+ import net.minecraft.nbt.NBTDynamicOps;
+@@ -39,6 +42,9 @@ public class RegionSectionCache<R> implements AutoCloseable {
     private final Function<Runnable, R> field_219124_f;
     private final DataFixer field_219125_g;
     private final DefaultTypeReferences field_219126_h;
@@ -1109,7 +1701,7 @@ index 61a0bd8..5263d1a 100644
  
     public RegionSectionCache(File p_i231897_1_, Function<Runnable, Codec<R>> p_i231897_2_, Function<Runnable, R> p_i231897_3_, DataFixer p_i231897_4_, DefaultTypeReferences p_i231897_5_, boolean p_i231897_6_) {
        this.field_235988_e_ = p_i231897_2_;
-@@ -62,23 +69,30 @@ public class RegionSectionCache<R> implements AutoCloseable {
+@@ -62,23 +68,30 @@ public class RegionSectionCache<R> implements AutoCloseable {
     }
  
     protected Optional<R> func_219113_d(long p_219113_1_) {
@@ -1152,7 +1744,7 @@ index 61a0bd8..5263d1a 100644
     }
  
     protected boolean func_219114_b(SectionPos p_219114_1_) {
-@@ -86,15 +100,21 @@ public class RegionSectionCache<R> implements AutoCloseable {
+@@ -86,15 +99,21 @@ public class RegionSectionCache<R> implements AutoCloseable {
     }
  
     protected R func_235995_e_(long p_235995_1_) {
@@ -1183,7 +1775,7 @@ index 61a0bd8..5263d1a 100644
        }
     }
  
-@@ -194,6 +214,8 @@ public class RegionSectionCache<R> implements AutoCloseable {
+@@ -194,6 +213,8 @@ public class RegionSectionCache<R> implements AutoCloseable {
     }
  
     public void saveIfDirty(ChunkPos p_219112_1_) {
@@ -1193,7 +1785,7 @@ index 61a0bd8..5263d1a 100644
           for(int i = 0; i < 16; ++i) {
              long j = SectionPos.from(p_219112_1_, i).asLong();
 diff --git a/build/mcp_diff_src/net/minecraft/world/server/ChunkManager.java b/src/main/java/net/minecraft/world/server/ChunkManager.java
-index 7b0aa0e..0cf1dc5 100644
+index 7b0aa0e..cd33e5e 100644
 --- a/build/mcp_diff_src/net/minecraft/world/server/ChunkManager.java
 +++ b/src/main/java/net/minecraft/world/server/ChunkManager.java
 @@ -9,12 +9,7 @@ import com.mojang.datafixers.DataFixer;
@@ -1242,7 +1834,17 @@ index 7b0aa0e..0cf1dc5 100644
     private final LongSet loadedPositions = new LongOpenHashSet();
     private final ServerWorld world;
     private final ServerWorldLightManager lightManager;
-@@ -182,7 +186,12 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+@@ -117,6 +121,9 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+    private final File dimensionDirectory;
+    private final PlayerGenerationTracker playerGenerationTracker = new PlayerGenerationTracker();
+    private final Int2ObjectMap<ChunkManager.EntityTracker> entities = new Int2ObjectOpenHashMap<>();
++   // Velox start: ChunkManager#entityTrackerLock
++   private final ReadWriteLock entityTrackerLock = new ReentrantReadWriteLock();
++   // Velox end
+    private final Long2ByteMap field_241087_z_ = new Long2ByteOpenHashMap();
+    private final Queue<Runnable> saveTasks = Queues.newConcurrentLinkedQueue();
+    private int viewDistance;
+@@ -182,7 +189,12 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
  
     @Nullable
     protected ChunkHolder func_219219_b(long chunkPosIn) {
@@ -1256,7 +1858,7 @@ index 7b0aa0e..0cf1dc5 100644
     }
  
     protected IntSupplier func_219191_c(long chunkPosIn) {
-@@ -319,7 +328,12 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+@@ -319,7 +331,12 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
  
     protected void save(boolean flush) {
        if (flush) {
@@ -1270,7 +1872,7 @@ index 7b0aa0e..0cf1dc5 100644
           MutableBoolean mutableboolean = new MutableBoolean();
  
           do {
-@@ -345,14 +359,21 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+@@ -345,14 +362,21 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
           this.func_227079_i_();
           LOGGER.info("ThreadedAnvilChunkStorage ({}): All chunks are saved", (Object)this.dimensionDirectory.getName());
        } else {
@@ -1299,7 +1901,7 @@ index 7b0aa0e..0cf1dc5 100644
        }
  
     }
-@@ -426,7 +447,11 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+@@ -426,7 +450,11 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
        if (!this.immutableLoadedChunksDirty) {
           return false;
        } else {
@@ -1311,7 +1913,7 @@ index 7b0aa0e..0cf1dc5 100644
           this.immutableLoadedChunksDirty = false;
           return true;
        }
-@@ -754,7 +779,12 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+@@ -754,7 +782,12 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
     }
  
     public int getLoadedChunkCount() {
@@ -1325,7 +1927,7 @@ index 7b0aa0e..0cf1dc5 100644
     }
  
     protected ChunkManager.ProxyTicketManager getTicketManager() {
-@@ -762,13 +792,23 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+@@ -762,13 +795,23 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
     }
  
     protected Iterable<ChunkHolder> getLoadedChunksIterable() {
@@ -1351,11 +1953,431 @@ index 7b0aa0e..0cf1dc5 100644
           ChunkPos chunkpos = new ChunkPos(entry.getLongKey());
           ChunkHolder chunkholder = entry.getValue();
           Optional<IChunk> optional = Optional.ofNullable(chunkholder.func_219287_e());
+@@ -852,82 +895,88 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+    }
+ 
+    public void updatePlayerPosition(ServerPlayerEntity player) {
+-      for(ChunkManager.EntityTracker chunkmanager$entitytracker : this.entities.values()) {
+-         if (chunkmanager$entitytracker.entity == player) {
+-            chunkmanager$entitytracker.updateTrackingState(this.world.getPlayers());
+-         } else {
+-            chunkmanager$entitytracker.updateTrackingState(player);
++      // Velox start: ChunkManager#updatePlayerPosition threadsafe
++      this.entityTrackerLock.writeLock().lock();
++      try {
++         for (ChunkManager.EntityTracker chunkmanager$entitytracker : this.entities.values()) {
++            if (chunkmanager$entitytracker.entity == player) {
++               chunkmanager$entitytracker.updateTrackingState(this.world.getPlayers());
++            } else {
++               chunkmanager$entitytracker.updateTrackingState(player);
++            }
+          }
+-      }
+ 
+-      int l1 = MathHelper.floor(player.getPosX()) >> 4;
+-      int i2 = MathHelper.floor(player.getPosZ()) >> 4;
+-      SectionPos sectionpos = player.getManagedSectionPos();
+-      SectionPos sectionpos1 = SectionPos.from(player);
+-      long i = sectionpos.asChunkPos().asLong();
+-      long j = sectionpos1.asChunkPos().asLong();
+-      boolean flag = this.playerGenerationTracker.canGeneratePlayer(player);
+-      boolean flag1 = this.cannotGenerateChunks(player);
+-      boolean flag2 = sectionpos.asLong() != sectionpos1.asLong();
+-      if (flag2 || flag != flag1) {
+-         this.func_223489_c(player);
+-         if (!flag) {
+-            this.ticketManager.removePlayer(sectionpos, player);
+-         }
++         int l1 = MathHelper.floor(player.getPosX()) >> 4;
++         int i2 = MathHelper.floor(player.getPosZ()) >> 4;
++         SectionPos sectionpos = player.getManagedSectionPos();
++         SectionPos sectionpos1 = SectionPos.from(player);
++         long i = sectionpos.asChunkPos().asLong();
++         long j = sectionpos1.asChunkPos().asLong();
++         boolean flag = this.playerGenerationTracker.canGeneratePlayer(player);
++         boolean flag1 = this.cannotGenerateChunks(player);
++         boolean flag2 = sectionpos.asLong() != sectionpos1.asLong();
++         if (flag2 || flag != flag1) {
++            this.func_223489_c(player);
++            if (!flag) {
++               this.ticketManager.removePlayer(sectionpos, player);
++            }
+ 
+-         if (!flag1) {
+-            this.ticketManager.updatePlayerPosition(sectionpos1, player);
+-         }
++            if (!flag1) {
++               this.ticketManager.updatePlayerPosition(sectionpos1, player);
++            }
+ 
+-         if (!flag && flag1) {
+-            this.playerGenerationTracker.disableGeneration(player);
+-         }
++            if (!flag && flag1) {
++               this.playerGenerationTracker.disableGeneration(player);
++            }
+ 
+-         if (flag && !flag1) {
+-            this.playerGenerationTracker.enableGeneration(player);
+-         }
++            if (flag && !flag1) {
++               this.playerGenerationTracker.enableGeneration(player);
++            }
+ 
+-         if (i != j) {
+-            this.playerGenerationTracker.updatePlayerPosition(i, j, player);
++            if (i != j) {
++               this.playerGenerationTracker.updatePlayerPosition(i, j, player);
++            }
+          }
+-      }
+ 
+-      int k = sectionpos.getSectionX();
+-      int l = sectionpos.getSectionZ();
+-      if (Math.abs(k - l1) <= this.viewDistance * 2 && Math.abs(l - i2) <= this.viewDistance * 2) {
+-         int k2 = Math.min(l1, k) - this.viewDistance;
+-         int i3 = Math.min(i2, l) - this.viewDistance;
+-         int j3 = Math.max(l1, k) + this.viewDistance;
+-         int k3 = Math.max(i2, l) + this.viewDistance;
+-
+-         for(int l3 = k2; l3 <= j3; ++l3) {
+-            for(int k1 = i3; k1 <= k3; ++k1) {
+-               ChunkPos chunkpos1 = new ChunkPos(l3, k1);
+-               boolean flag5 = getChunkDistance(chunkpos1, k, l) <= this.viewDistance;
+-               boolean flag6 = getChunkDistance(chunkpos1, l1, i2) <= this.viewDistance;
+-               this.setChunkLoadedAtClient(player, chunkpos1, new IPacket[2], flag5, flag6);
++         int k = sectionpos.getSectionX();
++         int l = sectionpos.getSectionZ();
++         if (Math.abs(k - l1) <= this.viewDistance * 2 && Math.abs(l - i2) <= this.viewDistance * 2) {
++            int k2 = Math.min(l1, k) - this.viewDistance;
++            int i3 = Math.min(i2, l) - this.viewDistance;
++            int j3 = Math.max(l1, k) + this.viewDistance;
++            int k3 = Math.max(i2, l) + this.viewDistance;
++
++            for (int l3 = k2; l3 <= j3; ++l3) {
++               for (int k1 = i3; k1 <= k3; ++k1) {
++                  ChunkPos chunkpos1 = new ChunkPos(l3, k1);
++                  boolean flag5 = getChunkDistance(chunkpos1, k, l) <= this.viewDistance;
++                  boolean flag6 = getChunkDistance(chunkpos1, l1, i2) <= this.viewDistance;
++                  this.setChunkLoadedAtClient(player, chunkpos1, new IPacket[2], flag5, flag6);
++               }
+             }
+-         }
+-      } else {
+-         for(int i1 = k - this.viewDistance; i1 <= k + this.viewDistance; ++i1) {
+-            for(int j1 = l - this.viewDistance; j1 <= l + this.viewDistance; ++j1) {
+-               ChunkPos chunkpos = new ChunkPos(i1, j1);
+-               boolean flag3 = true;
+-               boolean flag4 = false;
+-               this.setChunkLoadedAtClient(player, chunkpos, new IPacket[2], true, false);
++         } else {
++            for (int i1 = k - this.viewDistance; i1 <= k + this.viewDistance; ++i1) {
++               for (int j1 = l - this.viewDistance; j1 <= l + this.viewDistance; ++j1) {
++                  ChunkPos chunkpos = new ChunkPos(i1, j1);
++                  boolean flag3 = true;
++                  boolean flag4 = false;
++                  this.setChunkLoadedAtClient(player, chunkpos, new IPacket[2], true, false);
++               }
+             }
+-         }
+ 
+-         for(int j2 = l1 - this.viewDistance; j2 <= l1 + this.viewDistance; ++j2) {
+-            for(int l2 = i2 - this.viewDistance; l2 <= i2 + this.viewDistance; ++l2) {
+-               ChunkPos chunkpos2 = new ChunkPos(j2, l2);
+-               boolean flag7 = false;
+-               boolean flag8 = true;
+-               this.setChunkLoadedAtClient(player, chunkpos2, new IPacket[2], false, true);
++            for (int j2 = l1 - this.viewDistance; j2 <= l1 + this.viewDistance; ++j2) {
++               for (int l2 = i2 - this.viewDistance; l2 <= i2 + this.viewDistance; ++l2) {
++                  ChunkPos chunkpos2 = new ChunkPos(j2, l2);
++                  boolean flag7 = false;
++                  boolean flag8 = true;
++                  this.setChunkLoadedAtClient(player, chunkpos2, new IPacket[2], false, true);
++               }
+             }
+          }
++      } finally {
++         this.entityTrackerLock.writeLock().unlock();
+       }
+-
++      // Velox end
+    }
+ 
+    public Stream<ServerPlayerEntity> getTrackingPlayers(ChunkPos pos, boolean boundaryOnly) {
+@@ -942,78 +991,101 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+    }
+ 
+    protected void track(Entity entityIn) {
+-      if (!(entityIn instanceof EnderDragonPartEntity)) {
+-         EntityType<?> entitytype = entityIn.getType();
+-         int i = entitytype.func_233602_m_() * 16;
+-         int j = entitytype.getUpdateFrequency();
+-         if (this.entities.containsKey(entityIn.getEntityId())) {
+-            throw (IllegalStateException)Util.pauseDevMode(new IllegalStateException("Entity is already tracked!"));
+-         } else {
+-            ChunkManager.EntityTracker chunkmanager$entitytracker = new ChunkManager.EntityTracker(entityIn, i, j, entitytype.shouldSendVelocityUpdates());
+-            this.entities.put(entityIn.getEntityId(), chunkmanager$entitytracker);
+-            chunkmanager$entitytracker.updateTrackingState(this.world.getPlayers());
+-            if (entityIn instanceof ServerPlayerEntity) {
+-               ServerPlayerEntity serverplayerentity = (ServerPlayerEntity)entityIn;
+-               this.setPlayerTracking(serverplayerentity, true);
+-
+-               for(ChunkManager.EntityTracker chunkmanager$entitytracker1 : this.entities.values()) {
+-                  if (chunkmanager$entitytracker1.entity != serverplayerentity) {
+-                     chunkmanager$entitytracker1.updateTrackingState(serverplayerentity);
++      // Velox start: ChunkManager#track threadsafe
++      this.entityTrackerLock.writeLock().lock();
++      try {
++         if (!(entityIn instanceof EnderDragonPartEntity)) {
++            EntityType<?> entitytype = entityIn.getType();
++            int i = entitytype.func_233602_m_() * 16;
++            int j = entitytype.getUpdateFrequency();
++            if (this.entities.containsKey(entityIn.getEntityId())) {
++               throw (IllegalStateException) Util.pauseDevMode(new IllegalStateException("Entity is already tracked!"));
++            } else {
++               ChunkManager.EntityTracker chunkmanager$entitytracker = new ChunkManager.EntityTracker(entityIn, i, j, entitytype.shouldSendVelocityUpdates());
++               this.entities.put(entityIn.getEntityId(), chunkmanager$entitytracker);
++               chunkmanager$entitytracker.updateTrackingState(this.world.getPlayers());
++               if (entityIn instanceof ServerPlayerEntity) {
++                  ServerPlayerEntity serverplayerentity = (ServerPlayerEntity) entityIn;
++                  this.setPlayerTracking(serverplayerentity, true);
++
++                  for (ChunkManager.EntityTracker chunkmanager$entitytracker1 : this.entities.values()) {
++                     if (chunkmanager$entitytracker1.entity != serverplayerentity) {
++                        chunkmanager$entitytracker1.updateTrackingState(serverplayerentity);
++                     }
+                   }
+                }
+-            }
+ 
++            }
+          }
++      } finally {
++         this.entityTrackerLock.writeLock().unlock();
+       }
++      // Velox end
+    }
+ 
+    protected void untrack(Entity entity) {
+-      if (entity instanceof ServerPlayerEntity) {
+-         ServerPlayerEntity serverplayerentity = (ServerPlayerEntity)entity;
+-         this.setPlayerTracking(serverplayerentity, false);
++      // Velox start: ChunkManager#untrack threadsafe
++      this.entityTrackerLock.writeLock().lock();
++      try {
++         if (entity instanceof ServerPlayerEntity) {
++            ServerPlayerEntity serverplayerentity = (ServerPlayerEntity) entity;
++            this.setPlayerTracking(serverplayerentity, false);
+ 
+-         for(ChunkManager.EntityTracker chunkmanager$entitytracker : this.entities.values()) {
+-            chunkmanager$entitytracker.removeTracker(serverplayerentity);
++            for (ChunkManager.EntityTracker chunkmanager$entitytracker : this.entities.values()) {
++               chunkmanager$entitytracker.removeTracker(serverplayerentity);
++            }
+          }
+-      }
+ 
+-      ChunkManager.EntityTracker chunkmanager$entitytracker1 = this.entities.remove(entity.getEntityId());
+-      if (chunkmanager$entitytracker1 != null) {
+-         chunkmanager$entitytracker1.removeAllTrackers();
++         ChunkManager.EntityTracker chunkmanager$entitytracker1 = this.entities.remove(entity.getEntityId());
++         if (chunkmanager$entitytracker1 != null) {
++            chunkmanager$entitytracker1.removeAllTrackers();
++         }
++      } finally {
++         this.entityTrackerLock.writeLock().unlock();
+       }
+-
++      // Velox end
+    }
+ 
+    protected void tickEntityTracker() {
+-      List<ServerPlayerEntity> list = Lists.newArrayList();
+-      List<ServerPlayerEntity> list1 = this.world.getPlayers();
++      // Velox start: ChunkManager#tickEntityTracker threadsafe
++      this.entityTrackerLock.writeLock().lock();
++      try {
++         List<ServerPlayerEntity> list = Lists.newArrayList();
++         List<ServerPlayerEntity> list1 = this.world.getPlayers();
++
++         for (ChunkManager.EntityTracker chunkmanager$entitytracker : this.entities.values()) {
++            SectionPos sectionpos = chunkmanager$entitytracker.pos;
++            SectionPos sectionpos1 = SectionPos.from(chunkmanager$entitytracker.entity);
++            if (!Objects.equals(sectionpos, sectionpos1)) {
++               chunkmanager$entitytracker.updateTrackingState(list1);
++               Entity entity = chunkmanager$entitytracker.entity;
++               if (entity instanceof ServerPlayerEntity) {
++                  list.add((ServerPlayerEntity) entity);
++               }
+ 
+-      for(ChunkManager.EntityTracker chunkmanager$entitytracker : this.entities.values()) {
+-         SectionPos sectionpos = chunkmanager$entitytracker.pos;
+-         SectionPos sectionpos1 = SectionPos.from(chunkmanager$entitytracker.entity);
+-         if (!Objects.equals(sectionpos, sectionpos1)) {
+-            chunkmanager$entitytracker.updateTrackingState(list1);
+-            Entity entity = chunkmanager$entitytracker.entity;
+-            if (entity instanceof ServerPlayerEntity) {
+-               list.add((ServerPlayerEntity)entity);
++               chunkmanager$entitytracker.pos = sectionpos1;
+             }
+ 
+-            chunkmanager$entitytracker.pos = sectionpos1;
++            chunkmanager$entitytracker.entry.tick();
+          }
+ 
+-         chunkmanager$entitytracker.entry.tick();
+-      }
+-
+-      if (!list.isEmpty()) {
+-         for(ChunkManager.EntityTracker chunkmanager$entitytracker1 : this.entities.values()) {
+-            chunkmanager$entitytracker1.updateTrackingState(list);
++         if (!list.isEmpty()) {
++            for (ChunkManager.EntityTracker chunkmanager$entitytracker1 : this.entities.values()) {
++               chunkmanager$entitytracker1.updateTrackingState(list);
++            }
+          }
++      } finally {
++         this.entityTrackerLock.writeLock().unlock();
+       }
+-
++      // Velox end
+    }
+ 
+    protected void sendToAllTracking(Entity entity, IPacket<?> p_219222_2_) {
++      // Velox start: ChunkManager#sendToAllTracking threadsafe
++      this.entityTrackerLock.readLock().lock();
+       ChunkManager.EntityTracker chunkmanager$entitytracker = this.entities.get(entity.getEntityId());
++      this.entityTrackerLock.readLock().unlock();
++      // Velox end
+       if (chunkmanager$entitytracker != null) {
+          chunkmanager$entitytracker.sendToAllTracking(p_219222_2_);
+       }
+@@ -1021,7 +1093,11 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+    }
+ 
+    protected void sendToTrackingAndSelf(Entity entity, IPacket<?> p_219225_2_) {
++      // Velox start: ChunkManager#sendToTrackingAndSelf threadsafe
++      this.entityTrackerLock.readLock().lock();
+       ChunkManager.EntityTracker chunkmanager$entitytracker = this.entities.get(entity.getEntityId());
++      this.entityTrackerLock.readLock().unlock();
++      // Velox end
+       if (chunkmanager$entitytracker != null) {
+          chunkmanager$entitytracker.sendToTrackingAndSelf(p_219225_2_);
+       }
+@@ -1083,6 +1159,9 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+       private final int range;
+       private SectionPos pos;
+       private final Set<ServerPlayerEntity> trackingPlayers = Sets.newHashSet();
++      // Velox start: EntityTracker#lock
++      private final ReadWriteLock lock = new ReentrantReadWriteLock();
++      // Velox end
+ 
+       public EntityTracker(Entity entity, int p_i50468_3_, int updateFrequency, boolean sendVelocityUpdates) {
+          this.entry = new TrackedEntity(ChunkManager.this.world, entity, updateFrequency, sendVelocityUpdates, this::sendToAllTracking);
+@@ -1104,10 +1183,14 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+       }
+ 
+       public void sendToAllTracking(IPacket<?> p_219391_1_) {
+-         for(ServerPlayerEntity serverplayerentity : this.trackingPlayers) {
++         // Velox start: EntityTracker#sendToAllTracking threadsafe
++         this.lock.readLock().lock();
++         List<ServerPlayerEntity> trackingPlayers = Lists.newArrayList(this.trackingPlayers);
++         this.lock.readLock().unlock();
++         for(ServerPlayerEntity serverplayerentity : trackingPlayers) {
+             serverplayerentity.connection.sendPacket(p_219391_1_);
+          }
+-
++         // Velox end
+       }
+ 
+       public void sendToTrackingAndSelf(IPacket<?> p_219392_1_) {
+@@ -1119,42 +1202,54 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+       }
+ 
+       public void removeAllTrackers() {
++         // Velox start: EntityTracker#removeAllTrackers threadsafe
++         this.lock.writeLock().lock();
+          for(ServerPlayerEntity serverplayerentity : this.trackingPlayers) {
+             this.entry.untrack(serverplayerentity);
+          }
+-
++         this.lock.writeLock().unlock();
++         // Velox end
+       }
+ 
+       public void removeTracker(ServerPlayerEntity player) {
++         // Velox start: EntityTracker#removeTracker threadsafe
++         this.lock.writeLock().lock();
+          if (this.trackingPlayers.remove(player)) {
+             this.entry.untrack(player);
+          }
+-
++         this.lock.writeLock().unlock();
++         // Velox end
+       }
+ 
+       public void updateTrackingState(ServerPlayerEntity player) {
+-         if (player != this.entity) {
+-            Vector3d vector3d = player.getPositionVec().subtract(this.entry.getDecodedPosition());
+-            int i = Math.min(this.func_229843_b_(), (ChunkManager.this.viewDistance - 1) * 16);
+-            boolean flag = vector3d.x >= (double)(-i) && vector3d.x <= (double)i && vector3d.z >= (double)(-i) && vector3d.z <= (double)i && this.entity.isSpectatedByPlayer(player);
+-            if (flag) {
+-               boolean flag1 = this.entity.forceSpawn;
+-               if (!flag1) {
+-                  ChunkPos chunkpos = new ChunkPos(this.entity.chunkCoordX, this.entity.chunkCoordZ);
+-                  ChunkHolder chunkholder = ChunkManager.this.func_219219_b(chunkpos.asLong());
+-                  if (chunkholder != null && chunkholder.getChunkIfComplete() != null) {
+-                     flag1 = ChunkManager.func_219215_b(chunkpos, player, false) <= ChunkManager.this.viewDistance;
++         // Velox start: EntityTracker#updateTrackingState threadsafe
++         this.lock.writeLock().lock();
++         try {
++            if (player != this.entity) {
++               Vector3d vector3d = player.getPositionVec().subtract(this.entry.getDecodedPosition());
++               int i = Math.min(this.func_229843_b_(), (ChunkManager.this.viewDistance - 1) * 16);
++               boolean flag = vector3d.x >= (double) (-i) && vector3d.x <= (double) i && vector3d.z >= (double) (-i) && vector3d.z <= (double) i && this.entity.isSpectatedByPlayer(player);
++               if (flag) {
++                  boolean flag1 = this.entity.forceSpawn;
++                  if (!flag1) {
++                     ChunkPos chunkpos = new ChunkPos(this.entity.chunkCoordX, this.entity.chunkCoordZ);
++                     ChunkHolder chunkholder = ChunkManager.this.func_219219_b(chunkpos.asLong());
++                     if (chunkholder != null && chunkholder.getChunkIfComplete() != null) {
++                        flag1 = ChunkManager.func_219215_b(chunkpos, player, false) <= ChunkManager.this.viewDistance;
++                     }
+                   }
+-               }
+ 
+-               if (flag1 && this.trackingPlayers.add(player)) {
+-                  this.entry.track(player);
++                  if (flag1 && this.trackingPlayers.add(player)) {
++                     this.entry.track(player);
++                  }
++               } else if (this.trackingPlayers.remove(player)) {
++                  this.entry.untrack(player);
+                }
+-            } else if (this.trackingPlayers.remove(player)) {
+-               this.entry.untrack(player);
+             }
+-
++         } finally {
++            this.lock.writeLock().unlock();
+          }
++         // Velox end
+       }
+ 
+       private int func_241091_a_(int p_241091_1_) {
 diff --git a/build/mcp_diff_src/net/minecraft/world/server/ServerChunkProvider.java b/src/main/java/net/minecraft/world/server/ServerChunkProvider.java
-index 41500e3..6da66fc 100644
+index 41500e3..f23c38f 100644
 --- a/build/mcp_diff_src/net/minecraft/world/server/ServerChunkProvider.java
 +++ b/src/main/java/net/minecraft/world/server/ServerChunkProvider.java
-@@ -50,7 +50,9 @@ public class ServerChunkProvider extends AbstractChunkProvider {
+@@ -6,7 +6,6 @@ import com.mojang.datafixers.DataFixer;
+ import com.mojang.datafixers.util.Either;
+ import java.io.File;
+ import java.io.IOException;
+-import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.Optional;
+@@ -50,7 +49,9 @@ public class ServerChunkProvider extends AbstractChunkProvider {
     private static final List<ChunkStatus> field_217239_c = ChunkStatus.getAll();
     private final TicketManager ticketManager;
     private final ChunkGenerator generator;
@@ -1366,7 +2388,7 @@ index 41500e3..6da66fc 100644
     private final Thread mainThread;
     private final ServerWorldLightManager lightManager;
     private final ServerChunkProvider.ChunkExecutor executor;
-@@ -59,9 +61,7 @@ public class ServerChunkProvider extends AbstractChunkProvider {
+@@ -59,9 +60,7 @@ public class ServerChunkProvider extends AbstractChunkProvider {
     private long lastGameTime;
     private boolean spawnHostiles = true;
     private boolean spawnPassives = true;
@@ -1377,7 +2399,17 @@ index 41500e3..6da66fc 100644
     @Nullable
     private WorldEntitySpawner.EntityDensityManager field_241097_p_;
  
-@@ -93,97 +93,79 @@ public class ServerChunkProvider extends AbstractChunkProvider {
+@@ -77,7 +76,8 @@ public class ServerChunkProvider extends AbstractChunkProvider {
+       this.chunkManager = new ChunkManager(p_i232603_1_, p_i232603_2_, p_i232603_3_, p_i232603_4_, p_i232603_5_, this.executor, this, this.getChunkGenerator(), p_i232603_9_, p_i232603_10_, p_i232603_7_, p_i232603_8_);
+       this.lightManager = this.chunkManager.getLightManager();
+       this.ticketManager = this.chunkManager.getTicketManager();
+-      this.invalidateCaches();
++      // Velox deletion: don't invalidate the cache during initialization. Method invoked before the super class
++      // that implements the cache is initialized
+    }
+ 
+    public ServerWorldLightManager getLightManager() {
+@@ -93,97 +93,92 @@ public class ServerChunkProvider extends AbstractChunkProvider {
        return this.chunkManager.func_219174_c();
     }
  
@@ -1432,7 +2464,7 @@ index 41500e3..6da66fc 100644
 -         this.func_225315_a(i, ichunk1, requiredStatus);
 -         return ichunk1;
 +      // Velox start: Call chunk cache lookup
-+      IChunk chunk = lookupChunkCache(i);
++      IChunk chunk = lookupChunkCache(i, requiredStatus, load);
 +      if (chunk != null) {
 +         return chunk;
        }
@@ -1441,7 +2473,7 @@ index 41500e3..6da66fc 100644
 +      iprofiler.func_230035_c_("getChunkCacheMiss");
 +      CompletableFuture<Either<IChunk, ChunkHolder.IChunkLoadingError>> completablefuture = this.func_217233_c(chunkX, chunkZ, requiredStatus, load);
 +      this.executor.driveUntil(completablefuture::isDone);
-+      return completablefuture.join().map((p_222874_0_) -> {
++      chunk = completablefuture.join().map((p_222874_0_) -> {
 +         return p_222874_0_;
 +      }, (p_222870_1_) -> {
 +        if (load) {
@@ -1450,15 +2482,20 @@ index 41500e3..6da66fc 100644
 +            return null;
 +         }
 +      });
++      // Velox start: Call populateChunkCache
++      if (chunk != null)
++         populateChunkCache(chunkX, chunkZ, chunk);
 +      // Velox end
-    }
- 
-+   // Velox start: create lookupChunkCache which can be overridden to implement a chunk cache
-+   protected IChunk lookupChunkCache(long positionHash) {
-+      return null;
++      return chunk;
++      // Velox end
 +   }
-+   // Velox end
 +
++   // Velox start: create lookupChunkCache which can be overridden to implement a chunk cache
++   protected IChunk lookupChunkCache(long packedChunkPos, ChunkStatus requiredStatus, boolean load) {
++      return null;
+    }
++   // Velox end
+ 
     @Nullable
     public Chunk getChunkNow(int chunkX, int chunkZ) {
 -      if (Thread.currentThread() != this.mainThread) {
@@ -1477,7 +2514,7 @@ index 41500e3..6da66fc 100644
 -            }
 -         }
 +      // Velox start: Call chunk cache lookup
-+      IChunk chunk = lookupChunkCache(i);
++      IChunk chunk = lookupChunkCache(i, ChunkStatus.FULL, true);
 +      if (chunk != null) {
 +         return chunk instanceof Chunk ? (Chunk) chunk : null;
 +      }
@@ -1506,6 +2543,9 @@ index 41500e3..6da66fc 100644
 +            IChunk ichunk1 = either.left().orElse((IChunk)null);
 +            if (ichunk1 != null) {
 +               if (ichunk1 instanceof Chunk) {
++                  // Velox start: Call populateChunkCache
++                  populateChunkCache(chunkX, chunkZ, ichunk1);
++                  // Velox end
 +                  return (Chunk)ichunk1;
                 }
 -
@@ -1516,7 +2556,12 @@ index 41500e3..6da66fc 100644
           }
        }
 +      // Velox end
++   }
++
++   // Velox start: create populateChunkCache which can be implemented to create a chunk cache
++   protected void populateChunkCache(int chunkX, int chunkZ, IChunk chunk) {
     }
++   // velox end
  
 -   private void invalidateCaches() {
 -      Arrays.fill(this.recentPositions, ChunkPos.SENTINEL);
@@ -1529,16 +2574,229 @@ index 41500e3..6da66fc 100644
  
     @OnlyIn(Dist.CLIENT)
     public CompletableFuture<Either<IChunk, ChunkHolder.IChunkLoadingError>> func_217232_b(int chunkX, int chunkZ, ChunkStatus requiredStatus, boolean load) {
+diff --git a/build/mcp_diff_src/net/minecraft/world/server/ServerTickList.java b/src/main/java/net/minecraft/world/server/ServerTickList.java
+index bebc123..1898cca 100644
+--- a/build/mcp_diff_src/net/minecraft/world/server/ServerTickList.java
++++ b/src/main/java/net/minecraft/world/server/ServerTickList.java
+@@ -10,10 +10,13 @@ import java.util.List;
+ import java.util.Queue;
+ import java.util.Set;
+ import java.util.TreeSet;
++import java.util.concurrent.locks.ReadWriteLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
+ import java.util.function.Consumer;
+ import java.util.function.Function;
+ import java.util.function.Predicate;
+ import javax.annotation.Nullable;
++
+ import net.minecraft.block.BlockState;
+ import net.minecraft.crash.CrashReport;
+ import net.minecraft.crash.CrashReportCategory;
+@@ -37,6 +40,9 @@ public class ServerTickList<T> implements ITickList<T> {
+    private final Queue<NextTickListEntry<T>> pendingTickListEntriesThisTick = Queues.newArrayDeque();
+    private final List<NextTickListEntry<T>> entriesRunThisTick = Lists.newArrayList();
+    private final Consumer<NextTickListEntry<T>> tickFunction;
++   // Velox start: ServerTickList#lock
++   private final ReadWriteLock lock = new ReentrantReadWriteLock();
++   // Velox end
+ 
+    public ServerTickList(ServerWorld p_i231625_1_, Predicate<T> p_i231625_2_, Function<T, ResourceLocation> p_i231625_3_, Consumer<NextTickListEntry<T>> p_i231625_4_) {
+       this.filter = p_i231625_2_;
+@@ -46,55 +52,62 @@ public class ServerTickList<T> implements ITickList<T> {
+    }
+ 
+    public void tick() {
+-      int i = this.pendingTickListEntriesTreeSet.size();
+-      if (i != this.pendingTickListEntriesHashSet.size()) {
+-         throw new IllegalStateException("TickNextTick list out of synch");
+-      } else {
+-         if (i > 65536) {
+-            i = 65536;
+-         }
++      // Velox start: ServerTickList#tick threadsafe
++      this.lock.writeLock().lock();
++      try {
++         int i = this.pendingTickListEntriesTreeSet.size();
++         if (i != this.pendingTickListEntriesHashSet.size()) {
++            throw new IllegalStateException("TickNextTick list out of synch");
++         } else {
++            if (i > 65536) {
++               i = 65536;
++            }
+ 
+-         ServerChunkProvider serverchunkprovider = this.world.getChunkProvider();
+-         Iterator<NextTickListEntry<T>> iterator = this.pendingTickListEntriesTreeSet.iterator();
+-         this.world.getProfiler().startSection("cleaning");
++            ServerChunkProvider serverchunkprovider = this.world.getChunkProvider();
++            Iterator<NextTickListEntry<T>> iterator = this.pendingTickListEntriesTreeSet.iterator();
++            this.world.getProfiler().startSection("cleaning");
+ 
+-         while(i > 0 && iterator.hasNext()) {
+-            NextTickListEntry<T> nextticklistentry = iterator.next();
+-            if (nextticklistentry.field_235017_b_ > this.world.getGameTime()) {
+-               break;
+-            }
++            while (i > 0 && iterator.hasNext()) {
++               NextTickListEntry<T> nextticklistentry = iterator.next();
++               if (nextticklistentry.field_235017_b_ > this.world.getGameTime()) {
++                  break;
++               }
+ 
+-            if (serverchunkprovider.canTick(nextticklistentry.position)) {
+-               iterator.remove();
+-               this.pendingTickListEntriesHashSet.remove(nextticklistentry);
+-               this.pendingTickListEntriesThisTick.add(nextticklistentry);
+-               --i;
++               if (serverchunkprovider.canTick(nextticklistentry.position)) {
++                  iterator.remove();
++                  this.pendingTickListEntriesHashSet.remove(nextticklistentry);
++                  this.pendingTickListEntriesThisTick.add(nextticklistentry);
++                  --i;
++               }
+             }
+-         }
+ 
+-         this.world.getProfiler().endStartSection("ticking");
+-
+-         NextTickListEntry<T> nextticklistentry1;
+-         while((nextticklistentry1 = this.pendingTickListEntriesThisTick.poll()) != null) {
+-            if (serverchunkprovider.canTick(nextticklistentry1.position)) {
+-               try {
+-                  this.entriesRunThisTick.add(nextticklistentry1);
+-                  this.tickFunction.accept(nextticklistentry1);
+-               } catch (Throwable throwable) {
+-                  CrashReport crashreport = CrashReport.makeCrashReport(throwable, "Exception while ticking");
+-                  CrashReportCategory crashreportcategory = crashreport.makeCategory("Block being ticked");
+-                  CrashReportCategory.addBlockInfo(crashreportcategory, nextticklistentry1.position, (BlockState)null);
+-                  throw new ReportedException(crashreport);
++            this.world.getProfiler().endStartSection("ticking");
++
++            NextTickListEntry<T> nextticklistentry1;
++            while ((nextticklistentry1 = this.pendingTickListEntriesThisTick.poll()) != null) {
++               if (serverchunkprovider.canTick(nextticklistentry1.position)) {
++                  try {
++                     this.entriesRunThisTick.add(nextticklistentry1);
++                     this.tickFunction.accept(nextticklistentry1);
++                  } catch (Throwable throwable) {
++                     CrashReport crashreport = CrashReport.makeCrashReport(throwable, "Exception while ticking");
++                     CrashReportCategory crashreportcategory = crashreport.makeCategory("Block being ticked");
++                     CrashReportCategory.addBlockInfo(crashreportcategory, nextticklistentry1.position, (BlockState) null);
++                     throw new ReportedException(crashreport);
++                  }
++               } else {
++                  this.scheduleTick(nextticklistentry1.position, nextticklistentry1.getTarget(), 0);
+                }
+-            } else {
+-               this.scheduleTick(nextticklistentry1.position, nextticklistentry1.getTarget(), 0);
+             }
+-         }
+ 
+-         this.world.getProfiler().endSection();
+-         this.entriesRunThisTick.clear();
+-         this.pendingTickListEntriesThisTick.clear();
++            this.world.getProfiler().endSection();
++            this.entriesRunThisTick.clear();
++            this.pendingTickListEntriesThisTick.clear();
++         }
++      } finally {
++         this.lock.writeLock().unlock();
+       }
++      // Velox end
+    }
+ 
+    public boolean isTickPending(BlockPos pos, T obj) {
+@@ -110,17 +123,24 @@ public class ServerTickList<T> implements ITickList<T> {
+    }
+ 
+    public List<NextTickListEntry<T>> getPending(MutableBoundingBox p_205366_1_, boolean remove, boolean skipCompleted) {
+-      List<NextTickListEntry<T>> list = this.getEntries((List<NextTickListEntry<T>>)null, this.pendingTickListEntriesTreeSet, p_205366_1_, remove);
+-      if (remove && list != null) {
+-         this.pendingTickListEntriesHashSet.removeAll(list);
+-      }
++      // Velox start: ServerTickList#getPending threadsafe
++      try {
++         this.lock.writeLock().lock();
++         List<NextTickListEntry<T>> list = this.getEntries((List<NextTickListEntry<T>>) null, this.pendingTickListEntriesTreeSet, p_205366_1_, remove);
++         if (remove && list != null) {
++            this.pendingTickListEntriesHashSet.removeAll(list);
++         }
+ 
+-      list = this.getEntries(list, this.pendingTickListEntriesThisTick, p_205366_1_, remove);
+-      if (!skipCompleted) {
+-         list = this.getEntries(list, this.entriesRunThisTick, p_205366_1_, remove);
+-      }
++         list = this.getEntries(list, this.pendingTickListEntriesThisTick, p_205366_1_, remove);
++         if (!skipCompleted) {
++            list = this.getEntries(list, this.entriesRunThisTick, p_205366_1_, remove);
++         }
+ 
+-      return list == null ? Collections.emptyList() : list;
++         return list == null ? Collections.emptyList() : list;
++      } finally {
++         this.lock.writeLock().unlock();
++      }
++      // Velox end
+    }
+ 
+    @Nullable
+@@ -180,7 +200,12 @@ public class ServerTickList<T> implements ITickList<T> {
+    }
+ 
+    public boolean isTickScheduled(BlockPos pos, T itemIn) {
+-      return this.pendingTickListEntriesHashSet.contains(new NextTickListEntry(pos, itemIn));
++      // Velox start: ServerTickList#isTickScheduled threadsafe
++      this.lock.readLock().lock();
++      boolean contains = this.pendingTickListEntriesHashSet.contains(new NextTickListEntry(pos, itemIn));
++      this.lock.readLock().unlock();
++      // Velox end
++      return contains;
+    }
+ 
+    public void scheduleTick(BlockPos pos, T itemIn, int scheduledTime, TickPriority priority) {
+@@ -191,14 +216,22 @@ public class ServerTickList<T> implements ITickList<T> {
+    }
+ 
+    private void addEntry(NextTickListEntry<T> p_219504_1_) {
++      // Velox start: ServerTickList#addEntry threadsafe
++      this.lock.writeLock().lock();
+       if (!this.pendingTickListEntriesHashSet.contains(p_219504_1_)) {
+          this.pendingTickListEntriesHashSet.add(p_219504_1_);
+          this.pendingTickListEntriesTreeSet.add(p_219504_1_);
+       }
+-
++      this.lock.writeLock().unlock();
++      // Velox end
+    }
+ 
+    public int func_225420_a() {
+-      return this.pendingTickListEntriesHashSet.size();
++      // Velox start: ServerTickList#func_225420_a threadsafe
++      this.lock.readLock().lock();
++      int size = this.pendingTickListEntriesHashSet.size();
++      this.lock.readLock().unlock();
++      // Velox end
++      return size;
+    }
+ }
 diff --git a/build/mcp_diff_src/net/minecraft/world/server/ServerWorld.java b/src/main/java/net/minecraft/world/server/ServerWorld.java
-index 4913be6..6bc7b91 100644
+index 4913be6..8e9a2c1 100644
 --- a/build/mcp_diff_src/net/minecraft/world/server/ServerWorld.java
 +++ b/src/main/java/net/minecraft/world/server/ServerWorld.java
-@@ -35,6 +35,8 @@ import java.util.stream.Collectors;
+@@ -12,7 +12,6 @@ import it.unimi.dsi.fastutil.ints.Int2ObjectMap.Entry;
+ import it.unimi.dsi.fastutil.longs.LongSet;
+ import it.unimi.dsi.fastutil.longs.LongSets;
+ import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
+-import it.unimi.dsi.fastutil.objects.ObjectIterator;
+ import it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet;
+ import java.io.IOException;
+ import java.io.Writer;
+@@ -35,6 +34,9 @@ import java.util.stream.Collectors;
  import java.util.stream.Stream;
  import javax.annotation.Nonnull;
  import javax.annotation.Nullable;
 +
 +import me.mikex86.velox.chunk.ConcurrentChunkProvider;
++import me.mikex86.velox.tick.MadMaxTickManager;
  import net.minecraft.block.Block;
  import net.minecraft.block.BlockEventData;
  import net.minecraft.block.BlockState;
@@ -1555,7 +2813,7 @@ index 4913be6..6bc7b91 100644
        this.worldTeleporter = new Teleporter(this);
        this.calculateInitialSkylight();
        this.calculateInitialWeather();
-@@ -344,75 +348,101 @@ public class ServerWorld extends World implements ISeedReader {
+@@ -344,75 +348,105 @@ public class ServerWorld extends World implements ISeedReader {
        }
  
        if (flag3 || this.updateEntityTick++ < 300) {
@@ -1652,8 +2910,11 @@ index 4913be6..6bc7b91 100644
 +      }
 +      // tick entities
 +      {
-+         // build tick list
-+         this.tickRegionManager.buildEntityTickList(this.entitiesById.values().iterator());
++         if (MadMaxTickManager.MAD_MAX_MODE) {
++            MadMaxTickManager.tickMadMax(this.entitiesById.values(), this::tickEntity);
++         } else {
++            // build tick list
++            this.tickRegionManager.buildEntityTickList(this.entitiesById.values().iterator());
  
 -            iprofiler.endSection();
 -            iprofiler.startSection("remove");
@@ -1661,8 +2922,9 @@ index 4913be6..6bc7b91 100644
 -               this.removeFromChunk(entity1);
 -               objectiterator.remove();
 -               this.onEntityRemoved(entity1);
-+         // tick entities
-+         this.tickRegionManager.applyEntityTask(this::tickEntity);
++            // tick entities
++            this.tickRegionManager.applyEntityTask(this::tickEntity);
++         }
 +      }
 +      // remove all entities marked for removal from the entity lists (server global, chunk local, invoke listeners etc...)
 +      {
@@ -1708,3 +2970,322 @@ index 4913be6..6bc7b91 100644
  
     protected void func_241126_b_() {
        if (this.field_241107_Q_) {
+diff --git a/build/mcp_diff_src/net/minecraft/world/server/TicketManager.java b/src/main/java/net/minecraft/world/server/TicketManager.java
+index 45afd47..619bb5c 100644
+--- a/build/mcp_diff_src/net/minecraft/world/server/TicketManager.java
++++ b/src/main/java/net/minecraft/world/server/TicketManager.java
+@@ -20,7 +20,10 @@ import it.unimi.dsi.fastutil.objects.ObjectSet;
+ import java.util.Set;
+ import java.util.concurrent.CompletableFuture;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.locks.ReadWriteLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
+ import javax.annotation.Nullable;
++
+ import net.minecraft.entity.player.ServerPlayerEntity;
+ import net.minecraft.util.SortedArraySet;
+ import net.minecraft.util.concurrent.ITaskExecutor;
+@@ -48,6 +51,9 @@ public abstract class TicketManager {
+    private final LongSet chunkPositions = new LongOpenHashSet();
+    private final Executor field_219388_p;
+    private long currentTime;
++   // Velox start: TicketManager#lock
++   private final ReadWriteLock lock = new ReentrantReadWriteLock();
++   // Velox end
+ 
+    protected TicketManager(Executor p_i50707_1_, Executor p_i50707_2_) {
+       ITaskExecutor<Runnable> itaskexecutor = ITaskExecutor.inline("player ticket throttler", p_i50707_2_::execute);
+@@ -59,22 +65,28 @@ public abstract class TicketManager {
+    }
+ 
+    protected void tick() {
+-      ++this.currentTime;
+-      ObjectIterator<Entry<SortedArraySet<Ticket<?>>>> objectiterator = this.tickets.long2ObjectEntrySet().fastIterator();
+-
+-      while(objectiterator.hasNext()) {
+-         Entry<SortedArraySet<Ticket<?>>> entry = objectiterator.next();
+-         if (entry.getValue().removeIf((p_219370_1_) -> {
+-            return p_219370_1_.isExpired(this.currentTime);
+-         })) {
+-            this.ticketTracker.updateSourceLevel(entry.getLongKey(), getLevel(entry.getValue()), false);
+-         }
++      // Velox start: TicketManager#tick threadsafe
++      this.lock.writeLock().lock();
++      try {
++         ++this.currentTime;
++         ObjectIterator<Entry<SortedArraySet<Ticket<?>>>> objectiterator = this.tickets.long2ObjectEntrySet().fastIterator();
++
++         while (objectiterator.hasNext()) {
++            Entry<SortedArraySet<Ticket<?>>> entry = objectiterator.next();
++            if (entry.getValue().removeIf((p_219370_1_) -> {
++               return p_219370_1_.isExpired(this.currentTime);
++            })) {
++               this.ticketTracker.updateSourceLevel(entry.getLongKey(), getLevel(entry.getValue()), false);
++            }
+ 
+-         if (entry.getValue().isEmpty()) {
+-            objectiterator.remove();
++            if (entry.getValue().isEmpty()) {
++               objectiterator.remove();
++            }
+          }
++      } finally {
++        this.lock.writeLock().unlock();
+       }
+-
++      // Velox end
+    }
+ 
+    private static int getLevel(SortedArraySet<Ticket<?>> p_229844_0_) {
+@@ -90,71 +102,91 @@ public abstract class TicketManager {
+    protected abstract ChunkHolder setChunkLevel(long chunkPosIn, int newLevel, @Nullable ChunkHolder holder, int oldLevel);
+ 
+    public boolean processUpdates(ChunkManager chunkManager) {
+-      this.playerChunkTracker.processAllUpdates();
+-      this.playerTicketTracker.processAllUpdates();
+-      int i = Integer.MAX_VALUE - this.ticketTracker.func_215493_a(Integer.MAX_VALUE);
+-      boolean flag = i != 0;
+-      if (flag) {
+-      }
+-
+-      if (!this.chunkHolders.isEmpty()) {
+-         this.chunkHolders.forEach((p_219343_1_) -> {
+-            p_219343_1_.processUpdates(chunkManager);
+-         });
+-         this.chunkHolders.clear();
+-         return true;
+-      } else {
+-         if (!this.chunkPositions.isEmpty()) {
+-            LongIterator longiterator = this.chunkPositions.iterator();
++      // Velox start: TicketManager#processUpdates threadsafe
++      this.lock.writeLock().lock();
++      try {
++         this.playerChunkTracker.processAllUpdates();
++         this.playerTicketTracker.processAllUpdates();
++         int i = Integer.MAX_VALUE - this.ticketTracker.func_215493_a(Integer.MAX_VALUE);
++         boolean flag = i != 0;
++         if (flag) {
++         }
+ 
+-            while(longiterator.hasNext()) {
+-               long j = longiterator.nextLong();
+-               if (this.getTicketSet(j).stream().anyMatch((p_219369_0_) -> {
+-                  return p_219369_0_.getType() == TicketType.PLAYER;
+-               })) {
+-                  ChunkHolder chunkholder = chunkManager.func_219220_a(j);
+-                  if (chunkholder == null) {
+-                     throw new IllegalStateException();
+-                  }
++         if (!this.chunkHolders.isEmpty()) {
++            this.chunkHolders.forEach((p_219343_1_) -> {
++               p_219343_1_.processUpdates(chunkManager);
++            });
++            this.chunkHolders.clear();
++            return true;
++         } else {
++            if (!this.chunkPositions.isEmpty()) {
++               LongIterator longiterator = this.chunkPositions.iterator();
++
++               while (longiterator.hasNext()) {
++                  long j = longiterator.nextLong();
++                  if (this.getTicketSet(j).stream().anyMatch((p_219369_0_) -> {
++                     return p_219369_0_.getType() == TicketType.PLAYER;
++                  })) {
++                     ChunkHolder chunkholder = chunkManager.func_219220_a(j);
++                     if (chunkholder == null) {
++                        throw new IllegalStateException();
++                     }
+ 
+-                  CompletableFuture<Either<Chunk, ChunkHolder.IChunkLoadingError>> completablefuture = chunkholder.getEntityTickingFuture();
+-                  completablefuture.thenAccept((p_219363_3_) -> {
+-                     this.field_219388_p.execute(() -> {
+-                        this.field_219386_n.enqueue(ChunkTaskPriorityQueueSorter.func_219073_a(() -> {
+-                        }, j, false));
++                     CompletableFuture<Either<Chunk, ChunkHolder.IChunkLoadingError>> completablefuture = chunkholder.getEntityTickingFuture();
++                     completablefuture.thenAccept((p_219363_3_) -> {
++                        this.field_219388_p.execute(() -> {
++                           this.field_219386_n.enqueue(ChunkTaskPriorityQueueSorter.func_219073_a(() -> {
++                           }, j, false));
++                        });
+                      });
+-                  });
++                  }
+                }
++
++               this.chunkPositions.clear();
+             }
+ 
+-            this.chunkPositions.clear();
++            return flag;
+          }
+-
+-         return flag;
++      } finally {
++         this.lock.writeLock().unlock();
+       }
++      // Velox end
+    }
+ 
+    private void register(long chunkPosIn, Ticket<?> ticketIn) {
+-      SortedArraySet<Ticket<?>> sortedarrayset = this.getTicketSet(chunkPosIn);
+-      int i = getLevel(sortedarrayset);
+-      Ticket<?> ticket = sortedarrayset.func_226175_a_(ticketIn);
+-      ticket.setTimestamp(this.currentTime);
+-      if (ticketIn.getLevel() < i) {
+-         this.ticketTracker.updateSourceLevel(chunkPosIn, ticketIn.getLevel(), true);
++      // Velox start: TicketManager#register threadsafe
++      this.lock.writeLock().lock();
++      try {
++         SortedArraySet<Ticket<?>> sortedarrayset = this.getTicketSet(chunkPosIn);
++         int i = getLevel(sortedarrayset);
++         Ticket<?> ticket = sortedarrayset.func_226175_a_(ticketIn);
++         ticket.setTimestamp(this.currentTime);
++         if (ticketIn.getLevel() < i) {
++            this.ticketTracker.updateSourceLevel(chunkPosIn, ticketIn.getLevel(), true);
++         }
++      } finally {
++         this.lock.writeLock().unlock();
+       }
+-
++      // Velox end
+    }
+ 
+    private void release(long chunkPosIn, Ticket<?> ticketIn) {
+-      SortedArraySet<Ticket<?>> sortedarrayset = this.getTicketSet(chunkPosIn);
+-      if (sortedarrayset.remove(ticketIn)) {
+-      }
++      // Velox start: TicketManager#release threadsafe
++      this.lock.writeLock().lock();
++      try {
++         SortedArraySet<Ticket<?>> sortedarrayset = this.getTicketSet(chunkPosIn);
++         if (sortedarrayset.remove(ticketIn)) {
++         }
+ 
+-      if (sortedarrayset.isEmpty()) {
+-         this.tickets.remove(chunkPosIn);
+-      }
++         if (sortedarrayset.isEmpty()) {
++            this.tickets.remove(chunkPosIn);
++         }
+ 
+-      this.ticketTracker.updateSourceLevel(chunkPosIn, getLevel(sortedarrayset), false);
++         this.ticketTracker.updateSourceLevel(chunkPosIn, getLevel(sortedarrayset), false);
++      } finally {
++         this.lock.writeLock().unlock();
++      }
++      // Velox end
+    }
+ 
+    public <T> void registerWithLevel(TicketType<T> type, ChunkPos pos, int level, T value) {
+@@ -176,9 +208,17 @@ public abstract class TicketManager {
+    }
+ 
+    private SortedArraySet<Ticket<?>> getTicketSet(long p_229848_1_) {
+-      return this.tickets.computeIfAbsent(p_229848_1_, (p_229851_0_) -> {
+-         return SortedArraySet.newSet(4);
+-      });
++      // Velox start: TicketManager#getTicketSet threadsafe
++      this.lock.writeLock().lock();
++      try {
++         // Make sure the return value of this does not leave a writeLocked scope
++         return this.tickets.computeIfAbsent(p_229848_1_, (p_229851_0_) -> {
++            return SortedArraySet.newSet(4);
++         });
++      } finally {
++         this.lock.writeLock().unlock();
++      }
++      // Velox end
+    }
+ 
+    protected void forceChunk(ChunkPos pos, boolean add) {
+@@ -192,36 +232,55 @@ public abstract class TicketManager {
+    }
+ 
+    public void updatePlayerPosition(SectionPos sectionPosIn, ServerPlayerEntity player) {
+-      long i = sectionPosIn.asChunkPos().asLong();
+-      this.playersByChunkPos.computeIfAbsent(i, (p_219361_0_) -> {
+-         return new ObjectOpenHashSet();
+-      }).add(player);
+-      this.playerChunkTracker.updateSourceLevel(i, 0, true);
+-      this.playerTicketTracker.updateSourceLevel(i, 0, true);
++      // Velox start: TicketManager#updatePlayerPosition threadsafe
++      this.lock.writeLock().lock();
++      try {
++         long i = sectionPosIn.asChunkPos().asLong();
++         this.playersByChunkPos.computeIfAbsent(i, (p_219361_0_) -> {
++            return new ObjectOpenHashSet();
++         }).add(player);
++         this.playerChunkTracker.updateSourceLevel(i, 0, true);
++         this.playerTicketTracker.updateSourceLevel(i, 0, true);
++      } finally {
++         this.lock.writeLock().unlock();
++      }
++      // Velox end
+    }
+ 
+    public void removePlayer(SectionPos sectionPosIn, ServerPlayerEntity player) {
+-      long i = sectionPosIn.asChunkPos().asLong();
+-      ObjectSet<ServerPlayerEntity> objectset = this.playersByChunkPos.get(i);
+-      objectset.remove(player);
+-      if (objectset.isEmpty()) {
+-         this.playersByChunkPos.remove(i);
+-         this.playerChunkTracker.updateSourceLevel(i, Integer.MAX_VALUE, false);
+-         this.playerTicketTracker.updateSourceLevel(i, Integer.MAX_VALUE, false);
++      // Velox start: TicketManager#removePlayer threadsafe
++      this.lock.writeLock().lock();
++      try {
++         long i = sectionPosIn.asChunkPos().asLong();
++         ObjectSet<ServerPlayerEntity> objectset = this.playersByChunkPos.get(i);
++         objectset.remove(player);
++         if (objectset.isEmpty()) {
++            this.playersByChunkPos.remove(i);
++            this.playerChunkTracker.updateSourceLevel(i, Integer.MAX_VALUE, false);
++            this.playerTicketTracker.updateSourceLevel(i, Integer.MAX_VALUE, false);
++         }
++      } finally {
++         this.lock.writeLock().unlock();
+       }
+-
++      // Velox end
+    }
+ 
+    protected String func_225413_c(long p_225413_1_) {
+-      SortedArraySet<Ticket<?>> sortedarrayset = this.tickets.get(p_225413_1_);
+-      String s;
+-      if (sortedarrayset != null && !sortedarrayset.isEmpty()) {
+-         s = sortedarrayset.getSmallest().toString();
+-      } else {
+-         s = "no_ticket";
++      // Velox start: TicketManager#func_225413_c threadsafe
++      this.lock.readLock().lock();
++      try {
++         SortedArraySet<Ticket<?>> sortedarrayset = this.tickets.get(p_225413_1_);
++         String s;
++         if (sortedarrayset != null && !sortedarrayset.isEmpty()) {
++            s = sortedarrayset.getSmallest().toString();
++         } else {
++            s = "no_ticket";
++         }
++         return s;
++      } finally {
++         this.lock.readLock().unlock();
+       }
+-
+-      return s;
++      // Velox end
+    }
+ 
+    protected void setViewDistance(int viewDistance) {
+@@ -317,8 +376,11 @@ public abstract class TicketManager {
+       }
+ 
+       private boolean hasPlayerInChunk(long chunkPosIn) {
++         lock.readLock().lock();
+          ObjectSet<ServerPlayerEntity> objectset = TicketManager.this.playersByChunkPos.get(chunkPosIn);
+-         return objectset != null && !objectset.isEmpty();
++         boolean hasPlayerInChunk = objectset != null && !objectset.isEmpty();
++         lock.readLock().unlock();
++         return hasPlayerInChunk;
+       }
+ 
+       public void processAllUpdates() {
