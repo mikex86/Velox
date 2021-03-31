@@ -68,10 +68,10 @@ index 0000000..7641dab
 +}
 diff --git a/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java b/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java
 new file mode 100644
-index 0000000..84b4b32
+index 0000000..149742c
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,186 @@
 +package me.mikex86.velox.chunk;
 +
 +import java.util.concurrent.Executor;
@@ -221,6 +221,8 @@ index 0000000..84b4b32
 +
 +        // Populate L1 cache with the most popular values of L2
 +        // every 16 cache population calls
++        // Fuck thread-safety for this counter...
++        // "Oh no it was 17 times instead of 16 the world will burn"
 +        if (this.populateCacheCalls++ % 16 == 0) {
 +            int capacity = this.l1Cache.getCapacity();
 +            Long[] keysBoxed = new Long[capacity];
@@ -259,7 +261,7 @@ index 0000000..84b4b32
 \ No newline at end of file
 diff --git a/src/main/java/me/mikex86/velox/tick/MadMaxTickManager.java b/src/main/java/me/mikex86/velox/tick/MadMaxTickManager.java
 new file mode 100644
-index 0000000..dcea303
+index 0000000..cd69e3f
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/tick/MadMaxTickManager.java
 @@ -0,0 +1,45 @@
@@ -286,7 +288,7 @@ index 0000000..dcea303
 +     * Whether mad max mode is enabled
 +     * Debug/Development feature only.
 +     */
-+    public static boolean MAD_MAX_MODE = false;
++    public static boolean MAD_MAX_MODE = true;
 +
 +    private static final int nThreads = Runtime.getRuntime().availableProcessors();
 +    private static final ExecutorService service = MAD_MAX_MODE ? Executors.newFixedThreadPool(nThreads, new ThreadFactory() {
@@ -1364,6 +1366,79 @@ index 0000000..0f4225a
 +    }
 +
 +}
+diff --git a/build/mcp_diff_src/net/minecraft/profiler/Profiler.java b/src/main/java/net/minecraft/profiler/Profiler.java
+index ede31c4..8e18c4f 100644
+--- a/build/mcp_diff_src/net/minecraft/profiler/Profiler.java
++++ b/src/main/java/net/minecraft/profiler/Profiler.java
+@@ -35,6 +35,9 @@ public class Profiler implements IResultableProfiler {
+    @Nullable
+    private Profiler.Section field_230079_k_;
+    private final boolean field_226230_l_;
++   // Velox start: tick driving thread
++   private Thread drivingThread;
++   // Velox end
+ 
+    public Profiler(LongSupplier p_i231482_1_, IntSupplier p_i231482_2_, boolean p_i231482_3_) {
+       this.startTime = p_i231482_1_.getAsLong();
+@@ -48,6 +51,9 @@ public class Profiler implements IResultableProfiler {
+       if (this.tickStarted) {
+          LOGGER.error("Profiler tick already started - missing endTick()?");
+       } else {
++         // Velox start: set driving thread
++         this.drivingThread = Thread.currentThread();
++         // Velox end
+          this.tickStarted = true;
+          this.currentSectionName = "";
+          this.sectionList.clear();
+@@ -74,10 +80,14 @@ public class Profiler implements IResultableProfiler {
+       if (!this.tickStarted) {
+          LOGGER.error("Cannot push '{}' to profiler if profiler tick hasn't started - missing startTick()?", (Object)name);
+       } else {
++         // Velox start: check calling thread on profiler
++         if (Thread.currentThread() != this.drivingThread){
++            return;
++         }
++         // Velox end
+          if (!this.currentSectionName.isEmpty()) {
+             this.currentSectionName = this.currentSectionName + '\u001e';
+          }
+-
+          this.currentSectionName = this.currentSectionName + name;
+          this.sectionList.add(this.currentSectionName);
+          this.timeStack.add(Util.nanoTime());
+@@ -95,6 +105,11 @@ public class Profiler implements IResultableProfiler {
+       } else if (this.timeStack.isEmpty()) {
+          LOGGER.error("Tried to pop one too many times! Mismatched push() and pop()?");
+       } else {
++         // Velox start: check calling thread on profiler
++         if (Thread.currentThread() != this.drivingThread){
++            return;
++         }
++         // Velox end
+          long i = Util.nanoTime();
+          long j = this.timeStack.removeLong(this.timeStack.size() - 1);
+          this.sectionList.remove(this.sectionList.size() - 1);
+@@ -137,10 +152,20 @@ public class Profiler implements IResultableProfiler {
+    }
+ 
+    public void func_230035_c_(String p_230035_1_) {
++      // Velox start: check calling thread on profiler
++      if (Thread.currentThread() != this.drivingThread){
++         return;
++      }
++      // Velox end
+       this.func_230081_e_().field_230084_c_.addTo(p_230035_1_, 1L);
+    }
+ 
+    public void func_230036_c_(Supplier<String> p_230036_1_) {
++      // Velox start: check calling thread on profiler
++      if (Thread.currentThread() != this.drivingThread){
++         return;
++      }
++      // Velox end
+       this.func_230081_e_().field_230084_c_.addTo(p_230036_1_.get(), 1L);
+    }
+ 
 diff --git a/build/mcp_diff_src/net/minecraft/server/dedicated/DedicatedServer.java b/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
 index e1cb326..aa72ace 100644
 --- a/build/mcp_diff_src/net/minecraft/server/dedicated/DedicatedServer.java
@@ -1984,7 +2059,7 @@ index faed79c..bd97e9f 100644
  
     final class DistanceGraph extends SectionDistanceGraph {
 diff --git a/build/mcp_diff_src/net/minecraft/world/World.java b/src/main/java/net/minecraft/world/World.java
-index a53a1a5..c7f85fe 100644
+index a53a1a5..4fa7cd9 100644
 --- a/build/mcp_diff_src/net/minecraft/world/World.java
 +++ b/src/main/java/net/minecraft/world/World.java
 @@ -7,10 +7,13 @@ import java.util.Collection;
@@ -2010,10 +2085,10 @@ index a53a1a5..c7f85fe 100644
 -   protected final List<TileEntity> addedTileEntityList = Lists.newArrayList();
 -   protected final List<TileEntity> tileEntitiesToBeRemoved = Lists.newArrayList();
 +   // Velox start: make tile entity lists threadsafe
-+   public final List<TileEntity> loadedTileEntityList = new CopyOnWriteArrayList<>();
-+   public final List<TileEntity> tickableTileEntities = new CopyOnWriteArrayList<>();
-+   protected final List<TileEntity> addedTileEntityList = new CopyOnWriteArrayList<>();
-+   protected final List<TileEntity> tileEntitiesToBeRemoved = new CopyOnWriteArrayList<>();
++   public final List<TileEntity> loadedTileEntityList = Lists.newCopyOnWriteArrayList();
++   public final List<TileEntity> tickableTileEntities = Lists.newCopyOnWriteArrayList();
++   protected final List<TileEntity> addedTileEntityList = Lists.newCopyOnWriteArrayList();
++   protected final List<TileEntity> tileEntitiesToBeRemoved = Lists.newCopyOnWriteArrayList();
 +   // Velox end
     private final Thread mainThread;
     private final boolean isDebug;
@@ -2042,10 +2117,21 @@ index a53a1a5..c7f85fe 100644
           if (this.processingLoadedTiles) {
              tileentity = this.getPendingTileEntityAt(pos);
 diff --git a/build/mcp_diff_src/net/minecraft/world/chunk/Chunk.java b/src/main/java/net/minecraft/world/chunk/Chunk.java
-index a5ea695..7d3fc9f 100644
+index a5ea695..e6daa56 100644
 --- a/build/mcp_diff_src/net/minecraft/world/chunk/Chunk.java
 +++ b/src/main/java/net/minecraft/world/chunk/Chunk.java
-@@ -573,6 +573,9 @@ public class Chunk implements IChunk {
+@@ -69,7 +69,9 @@ public class Chunk implements IChunk {
+    private final World world;
+    private final Map<Heightmap.Type, Heightmap> heightMap = Maps.newEnumMap(Heightmap.Type.class);
+    private final UpgradeData upgradeData;
+-   private final Map<BlockPos, TileEntity> tileEntities = Maps.newHashMap();
++   // Velox start: Make Chunk#tileEntities map thread-safe
++   private final Map<BlockPos, TileEntity> tileEntities = Maps.newConcurrentMap();
++   // Velox end
+    private final ClassInheritanceMultiMap<Entity>[] entityLists;
+    private final Map<Structure<?>, StructureStart<?>> structureStarts = Maps.newHashMap();
+    private final Map<Structure<?>, LongSet> structureReferences = Maps.newHashMap();
+@@ -573,6 +575,9 @@ public class Chunk implements IChunk {
     }
  
     public void setLoaded(boolean loaded) {
@@ -2055,7 +2141,7 @@ index a5ea695..7d3fc9f 100644
        this.loaded = loaded;
     }
  
-@@ -795,4 +798,10 @@ public class Chunk implements IChunk {
+@@ -795,4 +800,10 @@ public class Chunk implements IChunk {
        QUEUED,
        CHECK;
     }
