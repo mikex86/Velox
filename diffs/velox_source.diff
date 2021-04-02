@@ -487,7 +487,7 @@ index 0000000..a900813
 +}
 diff --git a/src/main/java/me/mikex86/velox/tick/TickRegionManager.java b/src/main/java/me/mikex86/velox/tick/TickRegionManager.java
 new file mode 100644
-index 0000000..a2b06d9
+index 0000000..e7a777e
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/tick/TickRegionManager.java
 @@ -0,0 +1,288 @@
@@ -598,7 +598,7 @@ index 0000000..a2b06d9
 +            this.lock.writeLock().unlock();
 +        }
 +        long end = System.currentTimeMillis();
-+//        System.out.println("informChunkLoadStateChange(" + newLoadState + ") took: " + (end - start) + " ms; " + this);
++        System.out.println("informChunkLoadStateChange(" + newLoadState + ") took: " + (end - start) + " ms; TickRegionManager: " + this);
 +    }
 +
 +    // not thread safe
