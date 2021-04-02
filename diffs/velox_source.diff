@@ -68,7 +68,7 @@ index 0000000..0988453
 +}
 diff --git a/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java b/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java
 new file mode 100644
-index 0000000..f4f0ae1
+index 0000000..a4cc59b
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java
 @@ -0,0 +1,54 @@
@@ -123,7 +123,7 @@ index 0000000..f4f0ae1
 +
 +    @Override
 +    protected void populateChunkCache(int chunkX, int chunkZ, IChunk chunk, ChunkStatus requiredStatus, boolean load) {
-+
++        this.chunkCache.populateChunkCache(chunkX, chunkZ, chunk, requiredStatus, load);
 +    }
 +}
 diff --git a/src/main/java/me/mikex86/velox/chunk/cache/IChunkCache.java b/src/main/java/me/mikex86/velox/chunk/cache/IChunkCache.java
