@@ -2944,7 +2944,7 @@ index a78bb2e..bd92735 100644
     }
  }
 diff --git a/build/mcp_diff_src/net/minecraft/world/server/ServerWorld.java b/src/main/java/net/minecraft/world/server/ServerWorld.java
-index 7120174..20cc49b 100644
+index 7120174..cfef98b 100644
 --- a/build/mcp_diff_src/net/minecraft/world/server/ServerWorld.java
 +++ b/src/main/java/net/minecraft/world/server/ServerWorld.java
 @@ -35,6 +35,9 @@ import java.util.stream.Collectors;
@@ -2957,7 +2957,22 @@ index 7120174..20cc49b 100644
  import net.minecraft.block.Block;
  import net.minecraft.block.BlockEventData;
  import net.minecraft.block.BlockState;
-@@ -180,9 +183,11 @@ public class ServerWorld extends World implements ISeedReader {
+@@ -147,8 +150,12 @@ public class ServerWorld extends World implements ISeedReader {
+    public static final BlockPos END_SPAWN_POINT = new BlockPos(100, 50, 0);
+    private static final Logger LOGGER = LogManager.getLogger();
+    private final Int2ObjectMap<Entity> entitiesById = new Int2ObjectLinkedOpenHashMap<>();
+-   private final Map<UUID, Entity> entitiesByUuid = Maps.newHashMap();
+-   private final Queue<Entity> toAddAfterTick = Queues.newArrayDeque();
++   // Velox start: entitiesByUuid threadsafe
++   private final Map<UUID, Entity> entitiesByUuid = Maps.newConcurrentMap();
++   // Velox end
++   // Velox start: toAddAfterTick threadsafe
++   private final Queue<Entity> toAddAfterTick = Queues.newConcurrentLinkedQueue();
++   // Velox end
+    private final List<ServerPlayerEntity> players = Lists.newArrayList();
+    private final ServerChunkProvider chunkSource;
+    boolean tickingEntities;
+@@ -180,9 +187,11 @@ public class ServerWorld extends World implements ISeedReader {
        this.server = p_i241885_1_;
        this.customSpawners = p_i241885_12_;
        this.serverLevelData = p_i241885_4_;
@@ -2969,7 +2984,7 @@ index 7120174..20cc49b 100644
        this.portalForcer = new Teleporter(this);
        this.updateSkyBrightness();
        this.prepareWeather();
-@@ -344,75 +349,109 @@ public class ServerWorld extends World implements ISeedReader {
+@@ -344,75 +353,109 @@ public class ServerWorld extends World implements ISeedReader {
        }
  
        if (flag3 || this.emptyTime++ < 300) {
