@@ -18,16 +18,21 @@ builds.
 
 
 ## Multithreading
-Velox implements region based entity ticking. This means chunks that do not have
+Velox implements region based entity and block ticking. This means entities and blocks in chunks that do not have
 a loaded trail of chunks between them, will be ticked concurrently.
-This is not a full async tick, heavily performance demanding regions may still impact
+Dimensions are also ticked concurrently.
+This is not a full async tick, heavily performance demanding regions, even in different dimensions, may still impact
 server performance for other players.
 
 ### Is this safe?
 Yesn't...<br>
-The region model makes the assumption, that entities in different regions do not interact with one
+The region model makes the assumption, that entities/blocks in different regions do not interact with one
 another. In vanilla Minecraft this should never happen. If you are aware of any edge case
 where this might occur, please do not hesitate to create an issue.
+
+Maybe an even bigger problem are random elements of surprise in how Minecraft is implemented.
+No all code in Minecraft follows the principle of least astonishment and can therefore cause problems 
+nobody could expect till they arise. So, in a way, making Velox safer is a constant bug squashing battle.
 
 ## Why drop support for the Bukkit API?
 
