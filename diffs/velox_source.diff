@@ -1,12 +1,12 @@
 diff --git a/src/main/java/me/mikex86/velox/chunk/ChunkLoadStatePrinter.java b/src/main/java/me/mikex86/velox/chunk/ChunkLoadStatePrinter.java
 new file mode 100644
-index 0000000..0988453
+index 0000000..0f125a2
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/chunk/ChunkLoadStatePrinter.java
 @@ -0,0 +1,62 @@
 +package me.mikex86.velox.chunk;
 +
-+import me.mikex86.velox.tick.TickRegionManager;
++import me.mikex86.velox.tick.region.TickRegionManager;
 +import net.minecraft.util.math.ChunkPos;
 +import net.minecraft.world.chunk.*;
 +
@@ -29,8 +29,8 @@ index 0000000..0988453
 +            for (int z = zStart; z < zEnd; z++) {
 +
 +                int rgb;
-+                ChunkPos pos = currentlyUnloading.getPos();
-+                if (pos.x == x && pos.z == z) {
++                ChunkPos pos = currentlyUnloading != null ? currentlyUnloading.getPos() : null;
++                if (pos != null && pos.x == x && pos.z == z) {
 +                    rgb = Color.MAGENTA.getRGB();
 +                } else {
 +                    Chunk chunk = manager.getChunk(x, z);
@@ -274,13 +274,13 @@ index 0000000..a482916
 +        }
 +    }
 +}
-diff --git a/src/main/java/me/mikex86/velox/tick/MadMaxTickManager.java b/src/main/java/me/mikex86/velox/tick/MadMaxTickManager.java
+diff --git a/src/main/java/me/mikex86/velox/tick/debug/MadMaxTickManager.java b/src/main/java/me/mikex86/velox/tick/debug/MadMaxTickManager.java
 new file mode 100644
-index 0000000..7653d36
+index 0000000..3a1b568
 --- /dev/null
-+++ b/src/main/java/me/mikex86/velox/tick/MadMaxTickManager.java
++++ b/src/main/java/me/mikex86/velox/tick/debug/MadMaxTickManager.java
 @@ -0,0 +1,45 @@
-+package me.mikex86.velox.tick;
++package me.mikex86.velox.tick.debug;
 +
 +import me.mikex86.velox.utils.CollectionUtils;
 +import me.mikex86.velox.utils.Streamer;
@@ -325,17 +325,18 @@ index 0000000..7653d36
 +        }
 +    }
 +}
-diff --git a/src/main/java/me/mikex86/velox/tick/TickRegion.java b/src/main/java/me/mikex86/velox/tick/TickRegion.java
+diff --git a/src/main/java/me/mikex86/velox/tick/region/TickRegion.java b/src/main/java/me/mikex86/velox/tick/region/TickRegion.java
 new file mode 100644
-index 0000000..a900813
+index 0000000..b3890cb
 --- /dev/null
-+++ b/src/main/java/me/mikex86/velox/tick/TickRegion.java
-@@ -0,0 +1,154 @@
-+package me.mikex86.velox.tick;
++++ b/src/main/java/me/mikex86/velox/tick/region/TickRegion.java
+@@ -0,0 +1,147 @@
++package me.mikex86.velox.tick.region;
 +
 +import com.google.common.collect.Lists;
 +import com.google.common.collect.Maps;
 +import com.google.common.collect.Sets;
++import me.mikex86.velox.tick.ticklist.entity.EntityTickList;
 +import net.minecraft.entity.Entity;
 +import net.minecraft.util.math.ChunkPos;
 +import net.minecraft.world.chunk.Chunk;
@@ -346,7 +347,7 @@ index 0000000..a900813
 +public class TickRegion {
 +
 +    private final Map<ChunkPos, Chunk> chunkMap = Maps.newHashMap();
-+    private final List<Entity> entityTickList = Lists.newArrayList();
++    private final EntityTickList entityTickList = new EntityTickList();
 +
 +    public boolean addChunk(Chunk chunk) {
 +        return this.chunkMap.put(chunk.getPos(), chunk) == null;
@@ -356,18 +357,12 @@ index 0000000..a900813
 +        return this.chunkMap.remove(chunk.getPos()) != null;
 +    }
 +
-+    public void clearEntityTickList() {
-+        this.entityTickList.clear();
-+    }
-+
 +    public void addToEntityTickList(Entity entity) {
-+        this.entityTickList.add(entity);
++        this.entityTickList.scheduleTick(entity);
 +    }
 +
 +    public void applyTaskToEntityTickList(Consumer<Entity> entityTask) {
-+        for (Entity entity : this.entityTickList) {
-+            entityTask.accept(entity);
-+        }
++        this.entityTickList.performTickListTasks(entityTask);
 +    }
 +
 +    public boolean containsOrBorders(Chunk chunk) {
@@ -414,10 +409,8 @@ index 0000000..a900813
 +
 +        while (!chunkFloodQueue.isEmpty()) {
 +            Chunk chunk = chunkFloodQueue.remove();
-+            if (floodFilledChunks.contains(chunk))
-+                System.err.println("Wuiuiui");
-+            else
-+                floodFilledChunks.add(chunk);
++
++            floodFilledChunks.add(chunk);
 +
 +            visited.add(chunk);
 +            if (chunk == endChunk) {
@@ -485,16 +478,18 @@ index 0000000..a900813
 +        return this.chunkMap.get(chunkPos);
 +    }
 +}
-diff --git a/src/main/java/me/mikex86/velox/tick/TickRegionManager.java b/src/main/java/me/mikex86/velox/tick/TickRegionManager.java
+diff --git a/src/main/java/me/mikex86/velox/tick/region/TickRegionManager.java b/src/main/java/me/mikex86/velox/tick/region/TickRegionManager.java
 new file mode 100644
-index 0000000..e7a777e
+index 0000000..e4d5d04
 --- /dev/null
-+++ b/src/main/java/me/mikex86/velox/tick/TickRegionManager.java
-@@ -0,0 +1,288 @@
-+package me.mikex86.velox.tick;
++++ b/src/main/java/me/mikex86/velox/tick/region/TickRegionManager.java
+@@ -0,0 +1,341 @@
++package me.mikex86.velox.tick.region;
 +
 +import com.google.common.collect.Lists;
 +import com.google.common.collect.Maps;
++import com.google.common.collect.Queues;
++import me.mikex86.velox.utils.CollectionUtils;
 +import net.minecraft.entity.Entity;
 +import net.minecraft.util.math.BlockPos;
 +import net.minecraft.util.math.ChunkPos;
@@ -665,9 +660,6 @@ index 0000000..e7a777e
 +    public void buildEntityTickList(Iterator<Entity> entityIt, Predicate<Entity> tickingPredicate) {
 +        this.lock.writeLock().lock();
 +        try {
-+            for (TickRegion region : this.regionList) {
-+                region.clearEntityTickList();
-+            }
 +            while (entityIt.hasNext()) {
 +                Entity entity = entityIt.next();
 +                if (!tickingPredicate.test(entity)) {
@@ -689,25 +681,32 @@ index 0000000..e7a777e
 +
 +    public void applyEntityTask(Consumer<Entity> entityTask) {
 +        this.lock.readLock().lock();
-+        try {
-+            CountDownLatch latch = new CountDownLatch(this.regionList.size());
-+            for (TickRegion region : this.regionList) {
-+                service.submit(() -> {
++        Collection<TickRegion> regionIterable = CollectionUtils.immutableCopy(this.regionList);
++        this.lock.readLock().unlock();
++
++        CountDownLatch latch = new CountDownLatch(regionIterable.size());
++        for (TickRegion region : regionIterable) {
++            runAsync(() -> {
++                try {
 +                    try {
 +                        region.applyTaskToEntityTickList(entityTask);
 +                    } catch (Exception e) {
 +                        e.printStackTrace();
-+                    } finally {
-+                        latch.countDown();
 +                    }
-+                });
-+            }
++                } finally {
++                    latch.countDown();
++                }
++            });
++        }
++        try {
 +            latch.await();
 +        } catch (InterruptedException e) {
 +            e.printStackTrace();
-+        } finally {
-+            this.lock.readLock().unlock();
 +        }
++    }
++
++    private void runAsync(Runnable task) {
++        service.execute(task);
 +    }
 +
 +
@@ -778,6 +777,132 @@ index 0000000..e7a777e
 +            return null;
 +        return region.getChunk(x, z);
 +    }
++
++    public BlockPosTickList newBlockPosTickList() {
++        return new BlockPosTickList(this);
++    }
++
++    public static class BlockPosTickList {
++
++        private final TickRegionManager regionManager;
++        private final Map<TickRegion, Queue<Runnable>> regionTaskMap = Maps.newConcurrentMap();
++
++        private BlockPosTickList(TickRegionManager regionManager) {
++            this.regionManager = regionManager;
++        }
++
++        public void scheduleBlockPosTask(BlockPos pos, Runnable task) {
++            TickRegion tickRegion = this.regionManager.lookupRegion(pos.getX(), pos.getZ());
++            Queue<Runnable> taskQueue = this.regionTaskMap.get(tickRegion);
++            if (taskQueue == null) {
++                taskQueue = Queues.newConcurrentLinkedQueue();
++                this.regionTaskMap.put(tickRegion, taskQueue);
++            }
++            taskQueue.add(task);
++        }
++
++        public void runTasks() throws InterruptedException {
++            Collection<Map.Entry<TickRegion, Queue<Runnable>>> entries = CollectionUtils.immutableCopy(this.regionTaskMap.entrySet());
++            CountDownLatch latch = new CountDownLatch(entries.size());
++            for (Map.Entry<TickRegion, Queue<Runnable>> entry : entries) {
++                Queue<Runnable> tasks = entry.getValue();
++                this.regionManager.runAsync(() -> {
++                    try {
++                        try {
++                            while (!tasks.isEmpty()) {
++                                Runnable task = tasks.remove();
++                                task.run();
++                            }
++                        } catch (Exception e) {
++                            e.printStackTrace();
++                        }
++                    } finally {
++                        latch.countDown();
++                    }
++                });
++            }
++            latch.await();
++        }
++    }
++}
+diff --git a/src/main/java/me/mikex86/velox/tick/ticklist/block/ConcurrentTickList.java b/src/main/java/me/mikex86/velox/tick/ticklist/block/ConcurrentTickList.java
+new file mode 100644
+index 0000000..9b85f61
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/tick/ticklist/block/ConcurrentTickList.java
+@@ -0,0 +1,37 @@
++package me.mikex86.velox.tick.ticklist.block;
++
++import me.mikex86.velox.tick.region.TickRegionManager;
++import net.minecraft.util.ResourceLocation;
++import net.minecraft.world.NextTickListEntry;
++import net.minecraft.world.server.ServerTickList;
++import net.minecraft.world.server.ServerWorld;
++
++import java.util.function.Consumer;
++import java.util.function.Function;
++import java.util.function.Predicate;
++
++public class ConcurrentTickList<T> extends ServerTickList<T> {
++
++    private final TickRegionManager.BlockPosTickList tickList;
++
++    public ConcurrentTickList(ServerWorld p_i231625_1_, Predicate<T> p_i231625_2_, Function<T, ResourceLocation> p_i231625_3_, Consumer<NextTickListEntry<T>> p_i231625_4_) {
++        super(p_i231625_1_, p_i231625_2_, p_i231625_3_, p_i231625_4_);
++        TickRegionManager tickRegionManager = p_i231625_1_.tickRegionManager;
++        this.tickList = tickRegionManager.newBlockPosTickList();
++    }
++
++    @Override
++    protected void tickEntry(NextTickListEntry<T> entry) {
++        this.tickList.scheduleBlockPosTask(entry.pos, () -> super.tickEntry(entry));
++    }
++
++    @Override
++    protected void postTick() {
++        // Actually perform the ticks
++        try {
++            this.tickList.runTasks();
++        } catch (InterruptedException e) {
++            throw new RuntimeException(e);
++        }
++    }
++}
+diff --git a/src/main/java/me/mikex86/velox/tick/ticklist/entity/EntityTickList.java b/src/main/java/me/mikex86/velox/tick/ticklist/entity/EntityTickList.java
+new file mode 100644
+index 0000000..7b5757e
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/tick/ticklist/entity/EntityTickList.java
+@@ -0,0 +1,30 @@
++package me.mikex86.velox.tick.ticklist.entity;
++
++import net.minecraft.entity.Entity;
++
++import java.util.Queue;
++import java.util.concurrent.ConcurrentLinkedQueue;
++import java.util.function.Consumer;
++
++/**
++ * A simple tick list for entities.
++ * The entities to tick will be determined by calling {@link #scheduleTick(Entity)} on the entity to schedule to be ticked.
++ * {@link #performTickListTasks(Consumer)} will poll the entities and apply the ticker to perform the scheduled tick tasks
++ * for the entities.
++ */
++public class EntityTickList {
++
++    private final Queue<Entity> tickList = new ConcurrentLinkedQueue<>();
++
++    public void scheduleTick(Entity entity) {
++        this.tickList.add(entity);
++    }
++
++    public void performTickListTasks(Consumer<Entity> ticker) {
++        while (!this.tickList.isEmpty()) {
++            Entity entity = this.tickList.remove();
++            ticker.accept(entity);
++        }
++    }
++
 +}
 diff --git a/src/main/java/me/mikex86/velox/utils/ArrayUtils.java b/src/main/java/me/mikex86/velox/utils/ArrayUtils.java
 new file mode 100644
@@ -1409,6 +1534,61 @@ index 0000000..0f4225a
 +    }
 +
 +}
+diff --git a/src/main/java/me/mikex86/velox/utils/threading/ThreadingUtil.java b/src/main/java/me/mikex86/velox/utils/threading/ThreadingUtil.java
+new file mode 100644
+index 0000000..b937350
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/utils/threading/ThreadingUtil.java
+@@ -0,0 +1,27 @@
++package me.mikex86.velox.utils.threading;
++
++import java.util.List;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ThreadFactory;
++
++public class ThreadingUtil {
++
++    public static ExecutorService newWorkerPool(String name, int poolSize, List<Thread> threadsOut) {
++        return Executors.newFixedThreadPool(poolSize, new ThreadFactory() {
++
++            private int nThreads = 0;
++
++            @Override
++            public Thread newThread(Runnable r) {
++                Thread thread = new Thread(r, name + "Worker" + nThreads);
++                thread.setDaemon(true);
++                if (threadsOut != null)
++                    threadsOut.add(thread);
++                nThreads++;
++                return thread;
++            }
++        });
++    }
++
++}
+diff --git a/build/mcp_diff_src/net/minecraft/advancements/criterion/AbstractCriterionTrigger.java b/src/main/java/net/minecraft/advancements/criterion/AbstractCriterionTrigger.java
+index 0df6360..4fdaf7e 100644
+--- a/build/mcp_diff_src/net/minecraft/advancements/criterion/AbstractCriterionTrigger.java
++++ b/src/main/java/net/minecraft/advancements/criterion/AbstractCriterionTrigger.java
+@@ -15,11 +15,15 @@ import net.minecraft.loot.ConditionArrayParser;
+ import net.minecraft.loot.LootContext;
+ 
+ public abstract class AbstractCriterionTrigger<T extends CriterionInstance> implements ICriterionTrigger<T> {
+-   private final Map<PlayerAdvancements, Set<ICriterionTrigger.Listener<T>>> players = Maps.newIdentityHashMap();
++   // Velox start: player advancement map threadsafe
++   private final Map<PlayerAdvancements, Set<ICriterionTrigger.Listener<T>>> players = Maps.newConcurrentMap();
++   // Velox end
+ 
+    public final void addPlayerListener(PlayerAdvancements p_192165_1_, ICriterionTrigger.Listener<T> p_192165_2_) {
+       this.players.computeIfAbsent(p_192165_1_, (p_227072_0_) -> {
+-         return Sets.newHashSet();
++         // Velox start: players advancement map trigger listener set threadsafe
++         return Sets.newConcurrentHashSet();
++         // Velox end
+       }).add(p_192165_2_);
+    }
+ 
 diff --git a/build/mcp_diff_src/net/minecraft/command/impl/FillCommand.java b/src/main/java/net/minecraft/command/impl/FillCommand.java
 index f4b569e..d0b6792 100644
 --- a/build/mcp_diff_src/net/minecraft/command/impl/FillCommand.java
@@ -1595,6 +1775,126 @@ index 0cc4ce8..85ecca1 100644
     private int value;
     private int max = 100;
  
+diff --git a/build/mcp_diff_src/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index 746db22..89461e7 100644
+--- a/build/mcp_diff_src/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -44,12 +44,16 @@ import java.util.Set;
+ import java.util.UUID;
+ import java.util.Map.Entry;
+ import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.atomic.AtomicReference;
+ import java.util.function.BooleanSupplier;
+ import java.util.function.Function;
+ import javax.annotation.Nullable;
+ import javax.imageio.ImageIO;
++
++import me.mikex86.velox.utils.threading.ThreadingUtil;
+ import net.minecraft.advancements.AdvancementManager;
+ import net.minecraft.advancements.FunctionManager;
+ import net.minecraft.block.Block;
+@@ -814,34 +818,62 @@ public abstract class MinecraftServer extends RecursiveEventLoop<TickDelayedTask
+       this.profiler.pop();
+    }
+ 
++   // Velox start: Declare dimension tick driving executor and numDimensionDriverThreads
++   private ExecutorService dimensionTickExecutor = null;
++   private int numDimensionDriverThreads = -1;
++   // Velox end
++
+    protected void tickChildren(BooleanSupplier p_71190_1_) {
+       this.profiler.push("commandFunctions");
+       this.getFunctions().tick();
+       this.profiler.popPush("levels");
+-
+-      for(ServerWorld serverworld : this.getAllLevels()) {
+-         this.profiler.push(() -> {
+-            return serverworld + " " + serverworld.dimension().location();
++      // Velox start: parallelize dimension ticking
++      Collection<ServerWorld> allLevels = Lists.newArrayList(this.getAllLevels());
++      int nNeededDimensionDriverThreads = Math.min(Runtime.getRuntime().availableProcessors(), allLevels.size());
++      if (this.dimensionTickExecutor == null || this.numDimensionDriverThreads != nNeededDimensionDriverThreads) {
++         this.dimensionTickExecutor = ThreadingUtil.newWorkerPool("DimensionTickDriver", nNeededDimensionDriverThreads, null);
++         this.numDimensionDriverThreads = nNeededDimensionDriverThreads;
++      }
++      CountDownLatch latch = new CountDownLatch(allLevels.size());
++      for(ServerWorld serverworld : allLevels) {
++         this.dimensionTickExecutor.execute(() -> {
++            try {
++               try {
++                  this.profiler.push(() -> {
++                     return serverworld + " " + serverworld.dimension().location();
++                  });
++                  if (this.tickCount % 20 == 0) {
++                     this.profiler.push("timeSync");
++                     this.playerList.broadcastAll(new SUpdateTimePacket(serverworld.getGameTime(), serverworld.getDayTime(), serverworld.getGameRules().getBoolean(GameRules.RULE_DAYLIGHT)), serverworld.dimension());
++                     this.profiler.pop();
++                  }
++
++                  this.profiler.push("tick");
++
++                  try {
++                     serverworld.tick(p_71190_1_);
++                  } catch (Throwable throwable) {
++                     CrashReport crashreport = CrashReport.forThrowable(throwable, "Exception ticking world");
++                     serverworld.fillReportDetails(crashreport);
++                     throw new ReportedException(crashreport);
++                  }
++
++                  this.profiler.pop();
++                  this.profiler.pop();
++               } catch (Exception e) {
++                  e.printStackTrace();
++               }
++            } finally {
++               latch.countDown();
++            }
+          });
+-         if (this.tickCount % 20 == 0) {
+-            this.profiler.push("timeSync");
+-            this.playerList.broadcastAll(new SUpdateTimePacket(serverworld.getGameTime(), serverworld.getDayTime(), serverworld.getGameRules().getBoolean(GameRules.RULE_DAYLIGHT)), serverworld.dimension());
+-            this.profiler.pop();
+-         }
+-
+-         this.profiler.push("tick");
+-
+-         try {
+-            serverworld.tick(p_71190_1_);
+-         } catch (Throwable throwable) {
+-            CrashReport crashreport = CrashReport.forThrowable(throwable, "Exception ticking world");
+-            serverworld.fillReportDetails(crashreport);
+-            throw new ReportedException(crashreport);
+-         }
+-
+-         this.profiler.pop();
+-         this.profiler.pop();
+       }
++      try {
++         latch.await();
++      } catch (InterruptedException e) {
++         e.printStackTrace();
++      }
++      // Velox end
+ 
+       this.profiler.popPush("connection");
+       this.getConnection().tick();
+@@ -894,9 +926,12 @@ public abstract class MinecraftServer extends RecursiveEventLoop<TickDelayedTask
+       return this.levels.keySet();
+    }
+ 
+-   public Iterable<ServerWorld> getAllLevels() {
++   // Velox start: make getAllLevels
++   // Needed for: parallelize server dimensions
++   public Collection<ServerWorld> getAllLevels() {
+       return this.levels.values();
+    }
++   // Velox end
+ 
+    public String getServerVersion() {
+       return SharedConstants.getCurrentVersion().getName();
 diff --git a/build/mcp_diff_src/net/minecraft/util/ClassInheritanceMultiMap.java b/src/main/java/net/minecraft/util/ClassInheritanceMultiMap.java
 index 0ba4fdf..cf5f6bd 100644
 --- a/build/mcp_diff_src/net/minecraft/util/ClassInheritanceMultiMap.java
@@ -2009,7 +2309,7 @@ index de4b6ec..83cf9df 100644
     final class DistanceGraph extends SectionDistanceGraph {
        private final Long2ByteMap levels = new Long2ByteOpenHashMap();
 diff --git a/build/mcp_diff_src/net/minecraft/world/World.java b/src/main/java/net/minecraft/world/World.java
-index d5fbf20..3332e08 100644
+index d5fbf20..aad1406 100644
 --- a/build/mcp_diff_src/net/minecraft/world/World.java
 +++ b/src/main/java/net/minecraft/world/World.java
 @@ -7,10 +7,14 @@ import java.util.Collection;
@@ -2023,7 +2323,7 @@ index d5fbf20..3332e08 100644
  import java.util.function.Supplier;
  import javax.annotation.Nullable;
 +
-+import me.mikex86.velox.tick.TickRegionManager;
++import me.mikex86.velox.tick.region.TickRegionManager;
  import net.minecraft.block.AbstractFireBlock;
  import net.minecraft.block.Block;
  import net.minecraft.block.BlockState;
@@ -2242,8 +2542,23 @@ index 2ab06fe..3f91bd9 100644
     }
  }
 +// Velox end
+diff --git a/build/mcp_diff_src/net/minecraft/world/raid/RaidManager.java b/src/main/java/net/minecraft/world/raid/RaidManager.java
+index 67b540a..6b3430c 100644
+--- a/build/mcp_diff_src/net/minecraft/world/raid/RaidManager.java
++++ b/src/main/java/net/minecraft/world/raid/RaidManager.java
+@@ -26,7 +26,9 @@ import net.minecraft.world.server.ServerWorld;
+ import net.minecraft.world.storage.WorldSavedData;
+ 
+ public class RaidManager extends WorldSavedData {
+-   private final Map<Integer, Raid> raidMap = Maps.newHashMap();
++   // Velox start: RaidManager#raidMap threadsafe
++   private final Map<Integer, Raid> raidMap = Maps.newConcurrentMap();
++   // Velox end
+    private final ServerWorld level;
+    private int nextAvailableID;
+    private int tick;
 diff --git a/build/mcp_diff_src/net/minecraft/world/server/ChunkManager.java b/src/main/java/net/minecraft/world/server/ChunkManager.java
-index 5ebcd28..ec1aba2 100644
+index 5ebcd28..44872e8 100644
 --- a/build/mcp_diff_src/net/minecraft/world/server/ChunkManager.java
 +++ b/src/main/java/net/minecraft/world/server/ChunkManager.java
 @@ -9,27 +9,19 @@ import com.mojang.datafixers.DataFixer;
@@ -2287,20 +2602,22 @@ index 5ebcd28..ec1aba2 100644
  import net.minecraft.crash.CrashReport;
  import net.minecraft.crash.CrashReportCategory;
  import net.minecraft.crash.ReportedException;
-@@ -97,7 +91,11 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+@@ -96,8 +90,13 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+    private static final Logger LOGGER = LogManager.getLogger();
     public static final int MAX_CHUNK_DISTANCE = 33 + ChunkStatus.maxDistance();
     private final Long2ObjectLinkedOpenHashMap<ChunkHolder> updatingChunkMap = new Long2ObjectLinkedOpenHashMap<>();
++   // Velox start: visibleChunkMap volatile
++   // Velox comment: visibleChunkMap is safe to be read from other threads, never mutated, only instance copy on write switched
     private volatile Long2ObjectLinkedOpenHashMap<ChunkHolder> visibleChunkMap = this.updatingChunkMap.clone();
 -   private final Long2ObjectLinkedOpenHashMap<ChunkHolder> pendingUnloads = new Long2ObjectLinkedOpenHashMap<>();
-+   // Velox start: visibleChunkMap lock
-+   private final ReadWriteLock visibleChunkMapLock = new ReentrantReadWriteLock();
-+   // Velox start: Make ChunkManager#pendingUnloads public
-+   public final Long2ObjectLinkedOpenHashMap<ChunkHolder> pendingUnloads = new Long2ObjectLinkedOpenHashMap<>();
++   // Velox end
++   // Velox start: Make ChunkManager#pendingUnloads public and threadsafe
++   public final Long2ObjectMap<ChunkHolder> pendingUnloads = Long2ObjectMaps.synchronize(new Long2ObjectLinkedOpenHashMap<>());
 +   // Velox end
     private final LongSet entitiesInLevel = new LongOpenHashSet();
     private final ServerWorld level;
     private final ServerWorldLightManager lightEngine;
-@@ -116,6 +114,10 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+@@ -116,6 +115,10 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
     private final TemplateManager structureManager;
     private final File storageFolder;
     private final PlayerGenerationTracker playerMap = new PlayerGenerationTracker();
@@ -2311,105 +2628,45 @@ index 5ebcd28..ec1aba2 100644
     private final Int2ObjectMap<ChunkManager.EntityTracker> entityMap = new Int2ObjectOpenHashMap<>();
     private final Long2ByteMap chunkTypeCache = new Long2ByteOpenHashMap();
     private final Queue<Runnable> unloadQueue = Queues.newConcurrentLinkedQueue();
-@@ -182,7 +184,12 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
- 
-    @Nullable
-    protected ChunkHolder getVisibleChunkIfPresent(long p_219219_1_) {
--      return this.visibleChunkMap.get(p_219219_1_);
-+      // Velox start: threadsafe visibleChunkMap access
-+      this.visibleChunkMapLock.readLock().lock();
-+      ChunkHolder chunkHolder = this.visibleChunkMap.get(p_219219_1_);
-+      this.visibleChunkMapLock.readLock().unlock();
-+      // Velox end
-+      return chunkHolder;
-    }
- 
-    protected IntSupplier getChunkQueueLevel(long p_219191_1_) {
-@@ -319,7 +326,12 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
- 
+@@ -320,6 +323,7 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
     protected void saveAllChunks(boolean p_219177_1_) {
        if (p_219177_1_) {
-+         // Velox start: visible chunk map thread-safe access
-+         this.visibleChunkMapLock.readLock().lock();
           List<ChunkHolder> list = this.visibleChunkMap.values().stream().filter(ChunkHolder::wasAccessibleSinceLastSave).peek(ChunkHolder::refreshAccessibility).collect(Collectors.toList());
-+         this.visibleChunkMapLock.readLock().unlock();
-+         // Velox end
 +
           MutableBoolean mutableboolean = new MutableBoolean();
  
           do {
-@@ -345,6 +357,8 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
-          this.flushWorker();
-          LOGGER.info("ThreadedAnvilChunkStorage ({}): All chunks are saved", (Object)this.storageFolder.getName());
-       } else {
-+         // Velox start: threadsafe visibleChunkMap
-+         this.visibleChunkMapLock.readLock().lock();
-          this.visibleChunkMap.values().stream().filter(ChunkHolder::wasAccessibleSinceLastSave).forEach((p_222965_1_) -> {
-             IChunk ichunk = p_222965_1_.getChunkToSave().getNow((IChunk)null);
-             if (ichunk instanceof ChunkPrimerWrapper || ichunk instanceof Chunk) {
-@@ -353,6 +367,8 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
-             }
- 
-          });
-+         this.visibleChunkMapLock.readLock().unlock();
-+         // Velox end
-       }
- 
-    }
-@@ -426,7 +442,11 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
-       if (!this.modified) {
-          return false;
-       } else {
-+         // Velox start: visibleChunkMap threadsafe refresh
-+         this.visibleChunkMapLock.writeLock().lock();
-          this.visibleChunkMap = this.updatingChunkMap.clone();
-+         this.visibleChunkMapLock.writeLock().unlock();
-+         // Velox end
-          this.modified = false;
-          return true;
-       }
-@@ -754,7 +774,12 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
-    }
- 
-    public int size() {
--      return this.visibleChunkMap.size();
-+      // Velox start: visibleChunkMap threadsafe access
-+      this.visibleChunkMapLock.readLock().lock();
-+      int size = this.visibleChunkMap.size();
-+      this.visibleChunkMapLock.readLock().unlock();
-+      // Velox end
-+      return size;
-    }
- 
-    protected ChunkManager.ProxyTicketManager getDistanceManager() {
-@@ -762,13 +787,24 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+@@ -407,7 +411,6 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+                   Chunk chunk = (Chunk)p_219185_5_;
+                   this.level.unload(chunk);
+                }
+-
+                this.lightEngine.updateChunkStatus(p_219185_5_.getPos());
+                this.lightEngine.tryScheduleUpdate();
+                this.progressListener.onStatusChange(p_219185_5_.getPos(), (ChunkStatus)null);
+@@ -762,13 +765,19 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
     }
  
     protected Iterable<ChunkHolder> getChunks() {
 -      return Iterables.unmodifiableIterable(this.visibleChunkMap.values());
-+      // Velox start: visibleChunkMap threadsafe access
-+      this.visibleChunkMapLock.readLock().lock();
-+      Iterable<ChunkHolder> iterable = CollectionUtils.prefetchIterable(Iterables.unmodifiableIterable(this.visibleChunkMap.values()));
-+      this.visibleChunkMapLock.readLock().unlock();
++      // Velox start: prefech iteratable
++      return CollectionUtils.prefetchIterable(Iterables.unmodifiableIterable(this.visibleChunkMap.values()));
 +      // Velox end
-+      return iterable;
     }
  
     void dumpChunks(Writer p_225406_1_) throws IOException {
        CSVWriter csvwriter = CSVWriter.builder().addColumn("x").addColumn("z").addColumn("level").addColumn("in_memory").addColumn("status").addColumn("full_status").addColumn("accessible_ready").addColumn("ticking_ready").addColumn("entity_ticking_ready").addColumn("ticket").addColumn("spawning").addColumn("entity_count").addColumn("block_entity_count").build(p_225406_1_);
  
 -      for(Entry<ChunkHolder> entry : this.visibleChunkMap.long2ObjectEntrySet()) {
-+      // Velox start: visibleChunkMap threadsafe access
-+      this.visibleChunkMapLock.readLock().lock();
-+      List<Entry<ChunkHolder>> entrySet = CollectionUtils.collectToList(this.visibleChunkMap.long2ObjectEntrySet().iterator());
-+      this.visibleChunkMapLock.readLock().unlock();
++      // Velox start: Prefect iterable
++      Iterable<Entry<ChunkHolder>> entrySet = CollectionUtils.prefetchIterable(this.visibleChunkMap.long2ObjectEntrySet());
 +      // Velox end
 +
 +      for(Entry<ChunkHolder> entry : entrySet) {
           ChunkPos chunkpos = new ChunkPos(entry.getLongKey());
           ChunkHolder chunkholder = entry.getValue();
           Optional<IChunk> optional = Optional.ofNullable(chunkholder.getLastAvailable());
-@@ -851,84 +887,84 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+@@ -851,84 +860,84 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
        return sectionpos;
     }
  
@@ -2537,7 +2794,7 @@ index 5ebcd28..ec1aba2 100644
  
     public Stream<ServerPlayerEntity> getPlayers(ChunkPos p_219097_1_, boolean p_219097_2_) {
        return this.playerMap.getPlayers(p_219097_1_.toLong()).filter((p_219192_3_) -> {
-@@ -1082,7 +1118,9 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+@@ -1082,7 +1091,9 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
        private final Entity entity;
        private final int range;
        private SectionPos lastSectionPos;
@@ -2763,21 +3020,48 @@ index f0207fb..0dcd774 100644
     @OnlyIn(Dist.CLIENT)
     public CompletableFuture<Either<IChunk, ChunkHolder.IChunkLoadingError>> getChunkFuture(int p_217232_1_, int p_217232_2_, ChunkStatus p_217232_3_, boolean p_217232_4_) {
 diff --git a/build/mcp_diff_src/net/minecraft/world/server/ServerTickList.java b/src/main/java/net/minecraft/world/server/ServerTickList.java
-index a78bb2e..bd92735 100644
+index a78bb2e..43e65d5 100644
 --- a/build/mcp_diff_src/net/minecraft/world/server/ServerTickList.java
 +++ b/src/main/java/net/minecraft/world/server/ServerTickList.java
-@@ -10,6 +10,8 @@ import java.util.List;
- import java.util.Queue;
- import java.util.Set;
- import java.util.TreeSet;
+@@ -3,13 +3,10 @@ package net.minecraft.world.server;
+ import com.google.common.collect.Lists;
+ import com.google.common.collect.Queues;
+ import com.google.common.collect.Sets;
+-import java.util.Collection;
+-import java.util.Collections;
+-import java.util.Iterator;
+-import java.util.List;
+-import java.util.Queue;
+-import java.util.Set;
+-import java.util.TreeSet;
++
++import java.util.*;
 +import java.util.concurrent.locks.ReadWriteLock;
 +import java.util.concurrent.locks.ReentrantReadWriteLock;
  import java.util.function.Consumer;
  import java.util.function.Function;
  import java.util.function.Predicate;
-@@ -37,6 +39,10 @@ public class ServerTickList<T> implements ITickList<T> {
-    private final Queue<NextTickListEntry<T>> currentlyTicking = Queues.newArrayDeque();
-    private final List<NextTickListEntry<T>> alreadyTicked = Lists.newArrayList();
+@@ -31,12 +28,24 @@ import net.minecraft.world.TickPriority;
+ public class ServerTickList<T> implements ITickList<T> {
+    protected final Predicate<T> ignore;
+    private final Function<T, ResourceLocation> toId;
+-   private final Set<NextTickListEntry<T>> tickNextTickSet = Sets.newHashSet();
+-   private final TreeSet<NextTickListEntry<T>> tickNextTickList = Sets.newTreeSet(NextTickListEntry.createTimeComparator());
++   // Velox start: tickNextTickSet threadsafe
++   private final Set<NextTickListEntry<T>> tickNextTickSet = Sets.newConcurrentHashSet();
++   // Velox end
++   // Velox start: tickNextTickList threadsafe
++   private final SortedSet<NextTickListEntry<T>> tickNextTickList = Collections.synchronizedSortedSet(Sets.newTreeSet(NextTickListEntry.createTimeComparator()));
++   // Velox end
+    private final ServerWorld level;
+-   private final Queue<NextTickListEntry<T>> currentlyTicking = Queues.newArrayDeque();
+-   private final List<NextTickListEntry<T>> alreadyTicked = Lists.newArrayList();
++   // Velox start: currentlyTicking threadsafe
++   private final Queue<NextTickListEntry<T>> currentlyTicking = Queues.newLinkedBlockingDeque();
++   // Velox end
++   // Velox start: alreadyTicked threadsafe
++   private final List<NextTickListEntry<T>> alreadyTicked = Collections.synchronizedList(Lists.newLinkedList());
++   // Velox end
     private final Consumer<NextTickListEntry<T>> ticker;
 +   // Velox start: Make ServerTickList threadsafe
 +   // Reason: ServerTick list is modified concurrently by world generation
@@ -2786,7 +3070,7 @@ index a78bb2e..bd92735 100644
  
     public ServerTickList(ServerWorld p_i231625_1_, Predicate<T> p_i231625_2_, Function<T, ResourceLocation> p_i231625_3_, Consumer<NextTickListEntry<T>> p_i231625_4_) {
        this.ignore = p_i231625_2_;
-@@ -46,59 +52,71 @@ public class ServerTickList<T> implements ITickList<T> {
+@@ -46,59 +55,88 @@ public class ServerTickList<T> implements ITickList<T> {
     }
  
     public void tick() {
@@ -2860,7 +3144,9 @@ index a78bb2e..bd92735 100644
 +               if (serverchunkprovider.isTickingChunk(nextticklistentry1.pos)) {
 +                  try {
 +                     this.alreadyTicked.add(nextticklistentry1);
-+                     this.ticker.accept(nextticklistentry1);
++                     // Velox start: call tickEntry to tick tick list entry
++                     this.tickEntry(nextticklistentry1);
++                     // Velox end
 +                  } catch (Throwable throwable) {
 +                     CrashReport crashreport = CrashReport.forThrowable(throwable, "Exception while ticking");
 +                     CrashReportCategory crashreportcategory = crashreport.addCategory("Block being ticked");
@@ -2883,10 +3169,25 @@ index a78bb2e..bd92735 100644
 +            this.currentlyTicking.clear();
 +         }
 +      } finally {
++         // Velox end
 +         this.lock.writeLock().unlock();
++         // Velox start: call postTick().
++         // Velox comment: lock must be released before calling this, the caller may try to mutate this tick list.
++         this.postTick();
        }
 +      // Velox end
++   }
++
++   // Velox start: create tickEntry method
++   protected void tickEntry(NextTickListEntry<T> entry) {
++      this.ticker.accept(entry);
     }
++   // Velox end
++
++   // Velox start: create postTick
++   protected void postTick() {
++   }
++   // Velox end
  
     public boolean willTickThisTick(BlockPos p_205361_1_, T p_205361_2_) {
 -      return this.currentlyTicking.contains(new NextTickListEntry(p_205361_1_, p_205361_2_));
@@ -2899,7 +3200,7 @@ index a78bb2e..bd92735 100644
     }
  
     public List<NextTickListEntry<T>> fetchTicksInChunk(ChunkPos p_223188_1_, boolean p_223188_2_, boolean p_223188_3_) {
-@@ -110,6 +128,8 @@ public class ServerTickList<T> implements ITickList<T> {
+@@ -110,6 +148,8 @@ public class ServerTickList<T> implements ITickList<T> {
     }
  
     public List<NextTickListEntry<T>> fetchTicksInArea(MutableBoundingBox p_205366_1_, boolean p_205366_2_, boolean p_205366_3_) {
@@ -2908,7 +3209,7 @@ index a78bb2e..bd92735 100644
        List<NextTickListEntry<T>> list = this.fetchTicksInArea((List<NextTickListEntry<T>>)null, this.tickNextTickList, p_205366_1_, p_205366_2_);
        if (p_205366_2_ && list != null) {
           this.tickNextTickSet.removeAll(list);
-@@ -119,7 +139,8 @@ public class ServerTickList<T> implements ITickList<T> {
+@@ -119,7 +159,8 @@ public class ServerTickList<T> implements ITickList<T> {
        if (!p_205366_3_) {
           list = this.fetchTicksInArea(list, this.alreadyTicked, p_205366_1_, p_205366_2_);
        }
@@ -2918,7 +3219,7 @@ index a78bb2e..bd92735 100644
        return list == null ? Collections.emptyList() : list;
     }
  
-@@ -191,14 +212,22 @@ public class ServerTickList<T> implements ITickList<T> {
+@@ -191,14 +232,22 @@ public class ServerTickList<T> implements ITickList<T> {
     }
  
     private void addTickData(NextTickListEntry<T> p_219504_1_) {
@@ -2944,35 +3245,86 @@ index a78bb2e..bd92735 100644
     }
  }
 diff --git a/build/mcp_diff_src/net/minecraft/world/server/ServerWorld.java b/src/main/java/net/minecraft/world/server/ServerWorld.java
-index 7120174..cfef98b 100644
+index 7120174..93eda29 100644
 --- a/build/mcp_diff_src/net/minecraft/world/server/ServerWorld.java
 +++ b/src/main/java/net/minecraft/world/server/ServerWorld.java
+@@ -9,11 +9,11 @@ import com.google.common.collect.Sets;
+ import it.unimi.dsi.fastutil.ints.Int2ObjectLinkedOpenHashMap;
+ import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
+ import it.unimi.dsi.fastutil.ints.Int2ObjectMap.Entry;
++import it.unimi.dsi.fastutil.ints.Int2ObjectMaps;
+ import it.unimi.dsi.fastutil.longs.LongSet;
+ import it.unimi.dsi.fastutil.longs.LongSets;
+-import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
+-import it.unimi.dsi.fastutil.objects.ObjectIterator;
+-import it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet;
++import it.unimi.dsi.fastutil.objects.*;
++
+ import java.io.IOException;
+ import java.io.Writer;
+ import java.nio.file.Files;
 @@ -35,6 +35,9 @@ import java.util.stream.Collectors;
  import java.util.stream.Stream;
  import javax.annotation.Nonnull;
  import javax.annotation.Nullable;
 +
-+import me.mikex86.velox.chunk.ConcurrentChunkProvider;
-+import me.mikex86.velox.tick.MadMaxTickManager;
++import me.mikex86.velox.tick.debug.MadMaxTickManager;
++import me.mikex86.velox.tick.ticklist.block.ConcurrentTickList;
  import net.minecraft.block.Block;
  import net.minecraft.block.BlockEventData;
  import net.minecraft.block.BlockState;
-@@ -147,8 +150,12 @@ public class ServerWorld extends World implements ISeedReader {
+@@ -146,10 +149,18 @@ import org.apache.logging.log4j.Logger;
+ public class ServerWorld extends World implements ISeedReader {
     public static final BlockPos END_SPAWN_POINT = new BlockPos(100, 50, 0);
     private static final Logger LOGGER = LogManager.getLogger();
-    private final Int2ObjectMap<Entity> entitiesById = new Int2ObjectLinkedOpenHashMap<>();
+-   private final Int2ObjectMap<Entity> entitiesById = new Int2ObjectLinkedOpenHashMap<>();
 -   private final Map<UUID, Entity> entitiesByUuid = Maps.newHashMap();
 -   private final Queue<Entity> toAddAfterTick = Queues.newArrayDeque();
+-   private final List<ServerPlayerEntity> players = Lists.newArrayList();
++   // Velox start: entitiesById threadsafe
++   private final Int2ObjectMap<Entity> entitiesById = Int2ObjectMaps.synchronize(new Int2ObjectLinkedOpenHashMap<>());
++   // Velox end
 +   // Velox start: entitiesByUuid threadsafe
 +   private final Map<UUID, Entity> entitiesByUuid = Maps.newConcurrentMap();
 +   // Velox end
 +   // Velox start: toAddAfterTick threadsafe
 +   private final Queue<Entity> toAddAfterTick = Queues.newConcurrentLinkedQueue();
 +   // Velox end
-    private final List<ServerPlayerEntity> players = Lists.newArrayList();
++   // Velox start: players list threadsafe
++   private final List<ServerPlayerEntity> players = Lists.newCopyOnWriteArrayList();
++   // Velox end
     private final ServerChunkProvider chunkSource;
     boolean tickingEntities;
-@@ -180,9 +187,11 @@ public class ServerWorld extends World implements ISeedReader {
+    private final MinecraftServer server;
+@@ -158,15 +169,23 @@ public class ServerWorld extends World implements ISeedReader {
+    private boolean allPlayersSleeping;
+    private int emptyTime;
+    private final Teleporter portalForcer;
+-   private final ServerTickList<Block> blockTicks = new ServerTickList<>(this, (p_205341_0_) -> {
++   // Velox start: blockTicks use ConcurrentTickList
++   private final ServerTickList<Block> blockTicks = new ConcurrentTickList<>(this, (p_205341_0_) -> {
+       return p_205341_0_ == null || p_205341_0_.defaultBlockState().isAir();
+    }, Registry.BLOCK::getKey, this::tickBlock);
+-   private final ServerTickList<Fluid> liquidTicks = new ServerTickList<>(this, (p_205774_0_) -> {
++   // Velox end
++   // Velox start: liquidTicks use ConcurrentTickList
++   private final ServerTickList<Fluid> liquidTicks = new ConcurrentTickList<>(this, (p_205774_0_) -> {
+       return p_205774_0_ == null || p_205774_0_ == Fluids.EMPTY;
+    }, Registry.FLUID::getKey, this::tickLiquid);
+-   private final Set<PathNavigator> navigations = Sets.newHashSet();
++   // Velox end
++   // Velox start: navigations threadsafe
++   private final Set<PathNavigator> navigations = Sets.newConcurrentHashSet();
++   // Velox end
+    protected final RaidManager raids;
+-   private final ObjectLinkedOpenHashSet<BlockEventData> blockEvents = new ObjectLinkedOpenHashSet<>();
++   // Velox start: blockEvents threadsafe
++   private final Queue<BlockEventData> blockEvents = Queues.newLinkedBlockingDeque();
++   // Velox end
+    private boolean handlingTick;
+    private final List<ISpecialSpawner> customSpawners;
+    @Nullable
+@@ -180,9 +199,11 @@ public class ServerWorld extends World implements ISeedReader {
        this.server = p_i241885_1_;
        this.customSpawners = p_i241885_12_;
        this.serverLevelData = p_i241885_4_;
@@ -2984,7 +3336,7 @@ index 7120174..cfef98b 100644
        this.portalForcer = new Teleporter(this);
        this.updateSkyBrightness();
        this.prepareWeather();
-@@ -344,75 +353,109 @@ public class ServerWorld extends World implements ISeedReader {
+@@ -344,75 +365,113 @@ public class ServerWorld extends World implements ISeedReader {
        }
  
        if (flag3 || this.emptyTime++ < 300) {
@@ -3034,6 +3386,10 @@ index 7120174..cfef98b 100644
 -               if (!this.server.areNpcsEnabled() && entity1 instanceof INPC) {
 -                  entity1.remove();
 -               }
++      // run entityTickingTasks
++      while (!this.entityTickingTasks.isEmpty()) {
++         this.entityTickingTasks.remove().run();
++      }
  
 -               iprofiler.push("checkDespawn");
 -               if (!entity1.removed) {
@@ -3128,7 +3484,7 @@ index 7120174..cfef98b 100644
 -      iprofiler.pop();
 +      // tick block entities
 +      this.tickBlockEntities();
-+   }
+    }
 +   // Velox end
 +
 +   // Velox start: individual entity tick method
@@ -3139,11 +3495,52 @@ index 7120174..cfef98b 100644
 +         this.guardEntityTick(this::tickNonPassenger, entity);
 +      }
 +      profiler.pop();
-    }
++   }
 +   // Velox end
  
     protected void tickTime() {
        if (this.tickTime) {
+@@ -1019,7 +1078,9 @@ public class ServerWorld extends World implements ISeedReader {
+ 
+    private void runBlockEvents() {
+       while(!this.blockEvents.isEmpty()) {
+-         BlockEventData blockeventdata = this.blockEvents.removeFirst();
++         // Velox start: blockEvents remove() instead of removeFirst()
++         BlockEventData blockeventdata = this.blockEvents.remove();
++         // Velox end
+          if (this.doBlockEvent(blockeventdata)) {
+             this.server.getPlayerList().broadcast((PlayerEntity)null, (double)blockeventdata.getPos().getX(), (double)blockeventdata.getPos().getY(), (double)blockeventdata.getPos().getZ(), 64.0D, this.dimension(), new SBlockActionPacket(blockeventdata.getPos(), blockeventdata.getBlock(), blockeventdata.getParamA(), blockeventdata.getParamB()));
+          }
+@@ -1410,4 +1471,16 @@ public class ServerWorld extends World implements ISeedReader {
+          p_241121_0_.setBlockAndUpdate(p_241122_1_, Blocks.OBSIDIAN.defaultBlockState());
+       });
+    }
++
++   // Velox start: runTaskPreNextTick
++   private final Queue<Runnable> entityTickingTasks = Queues.newLinkedBlockingDeque();
++   /**
++    * Runs the specified runnable before the next tick starts. If the dimension is currently not being ticked, the
++    * task will not be executed until a player/forced chunk makes it tick.
++    * @param task the task to execute
++    */
++   public void runEntityTickingTaskNextTick(Runnable task) {
++      this.entityTickingTasks.add(task);
++   }
++   // Velox end
+ }
+diff --git a/build/mcp_diff_src/net/minecraft/world/server/ServerWorldLightManager.java b/src/main/java/net/minecraft/world/server/ServerWorldLightManager.java
+index 5d9de01..0d5114a 100644
+--- a/build/mcp_diff_src/net/minecraft/world/server/ServerWorldLightManager.java
++++ b/src/main/java/net/minecraft/world/server/ServerWorldLightManager.java
+@@ -26,7 +26,7 @@ import org.apache.logging.log4j.Logger;
+ 
+ public class ServerWorldLightManager extends WorldLightManager implements AutoCloseable {
+    private static final Logger LOGGER = LogManager.getLogger();
+-   private final DelegatedTaskExecutor<Runnable> taskMailbox;
++   private final ITaskExecutor<Runnable> taskMailbox;
+    private final ObjectList<Pair<ServerWorldLightManager.Phase, Runnable>> lightTasks = new ObjectArrayList<>();
+    private final ChunkManager chunkMap;
+    private final ITaskExecutor<ChunkTaskPriorityQueueSorter.FunctionEntry<Runnable>> sorterMailbox;
 diff --git a/build/mcp_diff_src/net/minecraft/world/server/TicketManager.java b/src/main/java/net/minecraft/world/server/TicketManager.java
 index 49f8f4a..caf86b2 100644
 --- a/build/mcp_diff_src/net/minecraft/world/server/TicketManager.java
