@@ -117,9 +117,8 @@ task applyDiffs() {
         }
         def diffs = file("diffs").listFiles()
         diffs.each { diff ->
-            def process = new ProcessBuilder("git apply \"${diff.path}\"")
+            def process = new ProcessBuilder("git apply \"${diff.absolutePath}\"")
                     .inheritIO()
-                    .directory(projectDir)
                     .start()
             process.waitFor()
         }
