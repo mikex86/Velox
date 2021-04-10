@@ -10,8 +10,11 @@ Compatibility with the Bukkit API is intentionally dropped to avoid running
 into limitations introduced by an API that was designed around the singled threaded architecture
 of Minecraft.
 
-Velox may implement its own plugin/modding API in the future, but the primary focus right now
-is to maximize server performance.
+
+## Velox Plugin API
+
+Velox implements a (at the moment very incomplete) Plugin API.
+To see an example plugin, visit: https://github.com/mikex86/VeloxExamplePlugin
 
 The project is in early development, but feel free to test the potentially unstable 
 builds.

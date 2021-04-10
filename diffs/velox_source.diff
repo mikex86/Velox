@@ -1,12 +1,12 @@
 diff --git a/src/main/java/me/mikex86/velox/chunk/ChunkLoadStatePrinter.java b/src/main/java/me/mikex86/velox/chunk/ChunkLoadStatePrinter.java
 new file mode 100644
-index 0000000..0f125a2
+index 0000000..239ec96
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/chunk/ChunkLoadStatePrinter.java
 @@ -0,0 +1,62 @@
 +package me.mikex86.velox.chunk;
 +
-+import me.mikex86.velox.tick.region.TickRegionManager;
++import me.mikex86.velox.tick.region.RegionTickManager;
 +import net.minecraft.util.math.ChunkPos;
 +import net.minecraft.world.chunk.*;
 +
@@ -21,7 +21,7 @@ index 0000000..0f125a2
 + */
 +public class ChunkLoadStatePrinter {
 +
-+    public static void printChunkLoadState(TickRegionManager manager, Chunk currentlyUnloading) {
++    public static void printChunkLoadState(RegionTickManager manager, Chunk currentlyUnloading) {
 +        int xStart = -2000, zStart = -2000;
 +        int xEnd = 2000, zEnd = 2000;
 +        BufferedImage image = new BufferedImage(xEnd - xStart, zEnd - zStart, BufferedImage.TYPE_4BYTE_ABGR);
@@ -276,10 +276,10 @@ index 0000000..a482916
 +}
 diff --git a/src/main/java/me/mikex86/velox/tick/debug/MadMaxTickManager.java b/src/main/java/me/mikex86/velox/tick/debug/MadMaxTickManager.java
 new file mode 100644
-index 0000000..3a1b568
+index 0000000..0cd9673
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/tick/debug/MadMaxTickManager.java
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,46 @@
 +package me.mikex86.velox.tick.debug;
 +
 +import me.mikex86.velox.utils.CollectionUtils;
@@ -317,6 +317,7 @@ index 0000000..3a1b568
 +    }) : null;
 +
 +    public static void tickMadMax(Collection<Entity> entities, Consumer<Entity> action) {
++        // TODO: IMPLEMENT TickRegionManager ENTITY REGION TASKS
 +        entities = CollectionUtils.immutableCopy(entities);
 +        try {
 +            Streamer.streamBatched(service, nThreads, entities, action);
@@ -325,12 +326,633 @@ index 0000000..3a1b568
 +        }
 +    }
 +}
+diff --git a/src/main/java/me/mikex86/velox/tick/global/WorldTickManager.java b/src/main/java/me/mikex86/velox/tick/global/WorldTickManager.java
+new file mode 100644
+index 0000000..f146270
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/tick/global/WorldTickManager.java
+@@ -0,0 +1,75 @@
++package me.mikex86.velox.tick.global;
++
++import com.google.common.collect.Maps;
++import com.google.common.collect.Queues;
++import me.mikex86.velox.tick.region.RegionTickManager;
++import me.mikex86.veloxapi.threading.WorldThreadGuard;
++import net.minecraft.world.World;
++import org.jetbrains.annotations.NotNull;
++import org.jetbrains.annotations.Nullable;
++
++import java.util.Map;
++import java.util.Optional;
++import java.util.Queue;
++
++/**
++ * Grants global synchronized access without concurrent interference to the global state of a world.
++ * Allows for the execution of tasks in that context.
++ */
++public class WorldTickManager {
++
++    private static final Map<Integer, Queue<Runnable>> worldTaskMap = Maps.newConcurrentMap();
++    private static final Map<Integer, Optional<Thread>> threadAccessMap = Maps.newConcurrentMap();
++    private static final Map<Integer, RegionTickManager> tickRegionManagers = Maps.newConcurrentMap();
++
++    public static void addTickRegionManager(@NotNull World world, @NotNull RegionTickManager regionTickManager) {
++        tickRegionManagers.put(world.getWorldId(), regionTickManager);
++    }
++
++    public static synchronized Queue<Runnable> getTaskQueue(int worldId) {
++        Queue<Runnable> tasks = worldTaskMap.get(worldId);
++        if (tasks == null) {
++            tasks = Queues.newConcurrentLinkedQueue();
++            worldTaskMap.put(worldId, tasks);
++        }
++        return tasks;
++    }
++
++    public static void runGlobalTask(World world, Runnable task) {
++        getTaskQueue(world.getWorldId()).add(task);
++    }
++
++    public static void runGlobalTask(WorldThreadGuard<? extends World> world, Runnable task) {
++        getTaskQueue(world.getWorldId()).add(task);
++    }
++
++    private static void grantCurrentThreadAccess(World world) {
++        int worldId = world.getWorldId();
++        threadAccessMap.put(worldId, Optional.of(Thread.currentThread()));
++    }
++
++    private static void revokeThreadAccess(World world) {
++        int worldId = world.getWorldId();
++        threadAccessMap.put(worldId, Optional.empty());
++    }
++
++    public static void runTasks(World world) {
++        int worldId = world.getWorldId();
++
++        grantCurrentThreadAccess(world);
++        Queue<Runnable> taskQueue = getTaskQueue(worldId);
++        while (!taskQueue.isEmpty()) {
++            taskQueue.remove().run();
++        }
++        revokeThreadAccess(world);
++    }
++
++    public static boolean hasThreadGlobalMutationAccess(WorldThreadGuard<? extends World> world, Thread thread) {
++        return threadAccessMap.get(world.getWorldId()).orElse(null) == thread;
++    }
++
++    @Nullable
++    public static RegionTickManager getWorldRegionTickManager(int worldId) {
++        return tickRegionManagers.get(worldId);
++    }
++}
+diff --git a/src/main/java/me/mikex86/velox/tick/region/RegionTickManager.java b/src/main/java/me/mikex86/velox/tick/region/RegionTickManager.java
+new file mode 100644
+index 0000000..f976e70
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/tick/region/RegionTickManager.java
+@@ -0,0 +1,534 @@
++package me.mikex86.velox.tick.region;
++
++import com.google.common.collect.ImmutableList;
++import com.google.common.collect.Lists;
++import com.google.common.collect.Maps;
++import com.google.common.collect.Queues;
++import me.mikex86.velox.tick.global.WorldTickManager;
++import me.mikex86.velox.tick.ticklist.entity.EntityTickList;
++import me.mikex86.velox.utils.CollectionUtils;
++import me.mikex86.veloxapi.region.Region;
++import me.mikex86.veloxapi.threading.EntityThreadGuard;
++import net.minecraft.entity.Entity;
++import net.minecraft.util.math.BlockPos;
++import net.minecraft.util.math.ChunkPos;
++import net.minecraft.world.World;
++import net.minecraft.world.chunk.Chunk;
++import net.minecraft.world.server.ChunkManager;
++import net.minecraft.world.server.ServerChunkProvider;
++import org.jetbrains.annotations.NotNull;
++
++import java.util.*;
++import java.util.concurrent.*;
++import java.util.concurrent.locks.ReadWriteLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
++import java.util.function.Consumer;
++import java.util.function.Predicate;
++
++/**
++ * Creates and destroys regions when chunks are loaded/unloaded.
++ * <p>
++ * Delegates tick list building and the scheduling of tasks on those tick lists to the individual regions.
++ */
++public class RegionTickManager {
++
++    private static final int nThreads = Runtime.getRuntime().availableProcessors();
++
++    // TODO: This is only static because multiple TickRegionManager instances can exist that should not have a service on their own claiming every core
++    // TODO: Config options
++    private static final ExecutorService service = new ThreadPoolExecutor(nThreads, nThreads,
++            0L, TimeUnit.MILLISECONDS,
++            new LinkedBlockingQueue<>(),
++            new ThreadFactory() {
++
++                private int nThreads = 0;
++
++                @Override
++                public Thread newThread(Runnable runnable) {
++                    Thread thread = new Thread(runnable, "TickWorker-" + nThreads);
++                    thread.setDaemon(true);
++                    nThreads++;
++                    return thread;
++                }
++            });
++
++    /**
++     * List containing all existing regions
++     */
++    private final List<TickRegion> regionList = Lists.newArrayList();
++
++    /**
++     * Maps the position of chunks to the TickRegion they are part of
++     */
++    private final Map<ChunkPos, TickRegion> tickRegionMap = Maps.newConcurrentMap();
++
++    /**
++     * A lock to ensure thread safe access to the TickRegionManager state
++     */
++    private final ReadWriteLock lock = new ReentrantReadWriteLock();
++
++    /**
++     * A queue for all entity tick tasks that should be executed in the respective regions
++     */
++    private final Queue<EntityTaskPair> entityInRegionTasks = Queues.newLinkedBlockingQueue();
++
++    /**
++     * The world the RegionTickManager is parent to
++     */
++    private final World world;
++
++    public RegionTickManager(World world) {
++        this.world = world;
++    }
++
++    /**
++     * Invoked when a chunk is either loaded or unloaded.
++     * The method will rebuild regions accordingly.
++     *
++     * @param chunk        the chunk that is getting loaded/unloaded
++     * @param newLoadState the new load state of the chunk. true, if the chunk is getting loaded, false if the chunk is getting unloaded.
++     */
++    public void informChunkLoadStateChange(Chunk chunk, boolean newLoadState) {
++        long start = System.currentTimeMillis();
++        this.lock.writeLock().lock();
++        try {
++            TickRegion chunkDstRegion = this.findRegion(chunk);
++            if (chunkDstRegion == null) {
++                chunkDstRegion = createRegion();
++            }
++            if (newLoadState) {
++                boolean modified = addChunkToRegion(chunkDstRegion, chunk);
++                if (!modified) {
++                    throw new IllegalStateException("Chunk was already contained in it's region before it was even loaded. This should never happen");
++                }
++                // Merge bordering regions:
++                // Checks if "chunk" borders any region that is not its current region.
++                // Removes the other region after adding its
++                // chunks to the region of "chunk"
++                for (Iterator<TickRegion> iterator = this.regionList.iterator(); iterator.hasNext(); ) {
++                    TickRegion region = iterator.next();
++                    if (region == chunkDstRegion) continue;
++                    if (region.containsOrBorders(chunk)) {
++                        mergeRegion(chunkDstRegion, region);
++                        iterator.remove();
++                    }
++                }
++            } else {
++                boolean modified = chunkDstRegion.removeChunk(chunk);
++                if (!modified) {
++                    throw new IllegalStateException("Chunk was already contained in it's region before it was even loaded. This should never happen");
++                }
++                if (chunkDstRegion.isEmpty()) {
++                    removeRegion(chunkDstRegion);
++                } else {
++                    checkRegionSplit(chunkDstRegion, chunk);
++                }
++            }
++        } finally {
++            this.lock.writeLock().unlock();
++        }
++        long end = System.currentTimeMillis();
++//        System.out.println("informChunkLoadStateChange(" + newLoadState + ") took: " + (end - start) + " ms; TickRegionManager: " + this);
++    }
++
++    // not thread safe
++    private void checkRegionSplit(TickRegion region, Chunk unloadedChunk) {
++        ChunkManager chunkManager = ((ServerChunkProvider) unloadedChunk.getLevel().getChunkSource()).chunkMap;
++        // Split the region if it is not continuous.
++        // Check for non continuity by checking if you can travel between
++        // the neighboring chunks of the chunk that has just been unloaded.
++        // We will create max. 4 regions in the worst case.
++
++        Collection<Chunk> allChunks = region.getChunks();
++
++        List<Chunk> neighbors = Lists.newArrayListWithCapacity(4);
++        region.getNeighbors(true, neighbors, Lists.newArrayList(), unloadedChunk);
++
++        assert neighbors.size() == 4;
++
++        for (int i = 0; i < neighbors.size() - 1; i++) {
++            Chunk neighbor1 = neighbors.get(i);
++            Chunk neighbor2 = neighbors.get(i + 1);
++            if (neighbor1 == null || neighbor2 == null)
++                continue;
++            List<Chunk> chunks = region.floodFillFromChunkUntilChunk(neighbor1, neighbor2);
++            Chunk lastChunk = chunks.get(chunks.size() - 1);
++            if (lastChunk != neighbor2) {
++                // we have not reached the neighboring chunk, the neighbors are in different regions
++                // if that is the case, "chunks" contains all chunks part of that region, because the flood fill didn't early stop.
++                if (!chunks.equals(allChunks)) {
++
++                    // Create new region with just the "chunks" list.
++                    // "chunks" may contain chunks that are pending unload.
++                    // In the worst case scenario, they are all pending unload, eg. on teleport.
++                    // In that case chunks will unload in basically random order resulting in catastrophically
++                    // high region complexity for the short time until those regions are deleted.
++                    // In that case, we don't want to even create a region, thus the initial null value of "newRegion".
++
++                    TickRegion newRegion = null;
++                    for (Chunk chunk : chunks) {
++                        if (chunkManager.pendingUnloads.containsKey(chunk.getPos().toLong())) {
++                            // Don't add this chunk to the new region, it is pending unload.
++                            // We are not yet removing it from the old region: When the chunk
++                            // is actually unloaded, #informChunkLoadStateChange will be invoked anyways.
++                            // Ticks might still be performed in those chunks. If we were to remove these from the region now,
++                            // these ticks could simply not be performed.
++                            continue;
++                        }
++                        // Create the region only then, when we know that at least one
++                        // chunk actually gets added to it.
++                        if (newRegion == null) {
++                            newRegion = createRegion();
++                        }
++                        newRegion.addChunk(chunk);
++                        region.removeChunk(chunk);
++                        if (region.isEmpty()) {
++                            removeRegion(region);
++                        }
++                        this.tickRegionMap.put(chunk.getPos(), newRegion);
++                    }
++                }
++            }
++        }
++    }
++
++    public void buildEntityTickList(Iterator<Entity> entityIt, Predicate<Entity> tickingPredicate) {
++        this.lock.writeLock().lock();
++        try {
++            while (entityIt.hasNext()) {
++                Entity entity = entityIt.next();
++                if (!tickingPredicate.test(entity)) {
++                    continue;
++                }
++                TickRegion region = this.lookupRegion(entity);
++                if (region == null) {
++                    // TODO: use a dummy region for these maybe existent edge cases?
++                    System.err.println("Could not find region for entity: " + entity);
++                } else {
++                    region.addToEntityTickList(entity);
++                }
++            }
++        } finally {
++            this.lock.writeLock().unlock();
++        }
++    }
++
++    public void applyEntityTask(Consumer<Entity> entityTask) {
++        this.lock.readLock().lock();
++        Collection<TickRegion> regionIterable = CollectionUtils.immutableCopy(this.regionList);
++        this.lock.readLock().unlock();
++
++        int nRegions = regionIterable.size();
++        CountDownLatch latch = new CountDownLatch(nRegions);
++        for (TickRegion region : regionIterable) {
++            runAsync(() -> {
++                region.setStateMutatingThread();
++                // Run entity state mutating tasks pre tick.
++                {
++                    Iterator<EntityTaskPair> iterator = this.entityInRegionTasks.iterator();
++                    while (iterator.hasNext()) {
++                        EntityTaskPair task = iterator.next();
++                        task.visited++;
++                        // willTick will only return false when the entity way already ticked.
++                        // We have not yet called applyTaskToEntityTickList.
++                        // and it will not be called until this loop completes.
++                        if (region.getEntityTickList().willTick(task.getEntityId())) {
++                            task.task.run();
++                            iterator.remove();
++                        }
++                    }
++                }
++                region.resetMutatingThread();
++                try {
++                    try {
++                        region.applyTaskToEntityTickList(entityTask);
++                    } catch (Exception e) {
++                        e.printStackTrace();
++                    }
++                } finally {
++                    latch.countDown();
++                }
++            });
++        }
++        try {
++            latch.await();
++        } catch (InterruptedException e) {
++            e.printStackTrace();
++        }
++        for (Iterator<EntityTaskPair> iterator = entityInRegionTasks.iterator(); iterator.hasNext(); ) {
++            EntityTaskPair task = iterator.next();
++            // If the task was checked by all regions if it should be executed on it,
++            // and it is still in this list, this means the entity is
++            // not in any region the TickRegionManager is tracking.
++            // The task could have been visited less than this number,
++            // if the task was added during the current tick.
++            // The region destined to received it, might have already completed
++            // the task visiting loop and has therefore missed it.
++            // In that case we do nothing, we leave it in the task queue
++            // and it will be dealt with next tick.
++            if (task.visited == nRegions) {
++                task.getOnOmitted().run();
++                iterator.remove();
++            }
++        }
++    }
++
++    private void runAsync(Runnable task) {
++        service.execute(task);
++    }
++
++    // weakly consistent, if #lock is not used
++    private TickRegion lookupRegion(int blockX, int blockZ) {
++        ChunkPos chunkPos = new ChunkPos(blockX >> 4, blockZ >> 4);
++        return this.tickRegionMap.get(chunkPos);
++    }
++
++    // weakly consistent, if #lock is not used
++    private TickRegion lookupRegion(BlockPos pos) {
++        ChunkPos chunkPos = new ChunkPos(pos.getX() >> 4, pos.getZ() >> 4);
++        return this.tickRegionMap.get(chunkPos);
++    }
++
++    // weakly consistent, if #lock is not used
++    private TickRegion lookupRegion(Entity entity) {
++        ChunkPos chunkPos = new ChunkPos(entity.xChunk, entity.zChunk);
++        return this.tickRegionMap.get(chunkPos);
++    }
++
++    private boolean addChunkToRegion(TickRegion region, Chunk chunk) {
++        this.tickRegionMap.put(chunk.getPos(), region);
++        return region.addChunk(chunk);
++    }
++
++    /**
++     * Merges the two regions.
++     *
++     * @param dstRegion the region to merge into
++     * @param srcRegion the region whose chunks should be merged into the other region
++     */
++    // not thread safe
++    private void mergeRegion(TickRegion dstRegion, TickRegion srcRegion) {
++        dstRegion.merge(srcRegion);
++        Collection<Chunk> chunks = srcRegion.getChunks();
++        for (Chunk chunk : chunks) {
++            this.tickRegionMap.put(chunk.getPos(), dstRegion);
++        }
++    }
++
++    // not thread safe
++    private void removeRegion(TickRegion region) {
++        Collection<Chunk> chunks = region.getChunks();
++        for (Chunk chunk : chunks) {
++            this.tickRegionMap.remove(chunk.getPos());
++        }
++        this.regionList.remove(region);
++    }
++
++    // not thread safe
++    private TickRegion createRegion() {
++        TickRegion region = new TickRegion();
++        this.regionList.add(region);
++        return region;
++    }
++
++    // not thread safe
++    private TickRegion findRegion(Chunk chunk) {
++        for (TickRegion region : this.regionList) {
++            if (region.containsOrBorders(chunk)) {
++                return region;
++            }
++        }
++        return null;
++    }
++
++    @Override
++    public String toString() {
++        return "RegionManager{" +
++                "numRegions=" + this.regionList.size() + ", " +
++                "regionList=" + this.regionList +
++                '}';
++    }
++
++    public Chunk getChunk(int x, int z) {
++        TickRegion region = this.lookupRegion(x, z);
++        if (region == null)
++            return null;
++        return region.getChunk(x, z);
++    }
++
++    public BlockPosTickList newBlockPosTickList() {
++        return new BlockPosTickList(this);
++    }
++
++    /**
++     * Runs an entity tick task in the region ticking the specified entity.
++     *
++     * @param entityId  the id of the entity that determines the region in which to execute the task
++     * @param task      the task to execute
++     * @param onOmitted is executed when the entity was not ticked during the following tick. It could be because the entity was removed / de-spawned / died etc.
++     */
++    public void runEntityTaskInRegion(int entityId, Runnable task, Runnable onOmitted) {
++        this.entityInRegionTasks.add(new EntityTaskPair(entityId, task, onOmitted));
++    }
++
++    /**
++     * Checks if the specified thread allowed to mutate the specified entity
++     */
++    public boolean isMutationAllowed(EntityThreadGuard<? extends Entity> entity, Thread thread) {
++        // Using weakly consistent position is fine here, the position can only change during entity tick.
++        // 1.
++        // If this method is invoked through on an in-region task for that entity, the entity is currently not being
++        // ticked, as the entity tick does not start until all in-region tasks that are scheduled are executed.
++        // 2.
++        // If the method is invoked concurrently (wrong thread in the first place)
++        // or during entity ticking of the region of the specified entity (not the mutating thread of the region, pre-tick task phase has ended),
++        // the entity might already have been ticked, in which case it is no longer on the EntityTickList.
++        // If this is the case, mutation is of course not allowed.
++        // 3.
++        // If the entity is yet to be ticked and therefore is still on the tick list and the current thread
++        // is the currently mutating thread of the region, mutation is allowed.
++        // 4.
++        // If the method was invoked on a tick worker during in-region task execution of a region whose tick list does not
++        // contain the entity, but the actual worker of that entity has already ticked that entity, modifying the position so that lookupRegion
++        // will return a region that that the entity was not ticked on, the entity tick list of that region would of course not contain
++        // the entity.
++        // Parts of the last tick of the entity that made the position change would have happened "on the wrong thread", in that case
++        // we have to hope for the best. // TODO: FIX IDEAS?
++        // We do not authorize write access to that entity on the current thread because we can't even be sure that the entity's tick
++        // has completed by now. That is achieved by the willTick check, even in the special case where the mutation thread of that region would have matched,
++        // when the entity teleported into the region we have mutation access to. Don't touch an entity that might still be ticked that is actually in our
++        // region. That case is risky enough in vanilla minecraft, we don't want plugins to make it even worse.
++        TickRegion tickRegion = lookupRegion(entity.getWeaklyConsistentPosition());
++        if (!tickRegion.getEntityTickList().willTick(entity.getEntityId())) {
++            return false;
++        }
++        return tickRegion.getMutatingThread() == thread;
++    }
++
++    /**
++     * Runs a task for all regions as a world global task.
++     * Task execution is concurrent between regions.
++     *
++     * @param task the task runnable that is invoked concurrently with all regions
++     */
++    public void runTaskInAllRegions(Consumer<Region> task) {
++        WorldTickManager.runGlobalTask(this.world, () -> {
++            Collection<Region> regions = regions(); // regions are not weakly consistent in global world task
++            CountDownLatch latch = new CountDownLatch(regions.size());
++            for (Region region : regions) {
++                runAsync(() -> task.accept(region));
++            }
++            try {
++                latch.await();
++            } catch (InterruptedException e) {
++                e.printStackTrace();
++            }
++        });
++    }
++
++    /**
++     * @return the regions that the region tick manager tracks. Weakly consistent, lifecycle disposable, does not expose mutability to internal state
++     */
++    @NotNull
++    private Collection<Region> regions() {
++        this.lock.readLock().lock();
++        Collection<TickRegion> regionIterable = CollectionUtils.immutableCopy(this.regionList);
++        Collection<Region> regions = Lists.newArrayList();
++        for (TickRegion region : regionIterable) {
++            EntityTickList tickList = region.getEntityTickList();
++            regions.add(DisposableImmutableRegionSnapshot.immutableCopyOf(tickList.getTickListUnsafe()));
++        }
++        this.lock.readLock().unlock();
++        return regions;
++    }
++
++    private static class DisposableImmutableRegionSnapshot implements Region {
++
++        @NotNull
++        private final Iterable<Entity> entities;
++
++        private DisposableImmutableRegionSnapshot(@NotNull Iterable<Entity> entities) {
++            this.entities = entities;
++        }
++
++        @NotNull
++        public static Region immutableCopyOf(@NotNull Iterable<Entity> entities) {
++            return new DisposableImmutableRegionSnapshot(ImmutableList.copyOf(entities));
++        }
++
++        @NotNull
++        @Override
++        public Iterable<Entity> entities() {
++            return this.entities;
++        }
++    }
++
++    private static class EntityTaskPair {
++
++        private final int entityId;
++        private final Runnable task;
++        private final Runnable onOmitted;
++        public int visited = 0;
++
++        public EntityTaskPair(int entityId, Runnable task, Runnable onOmitted) {
++            this.entityId = entityId;
++            this.task = task;
++            this.onOmitted = onOmitted;
++        }
++
++        public int getEntityId() {
++            return entityId;
++        }
++
++        public Runnable getTask() {
++            return task;
++        }
++
++        public Runnable getOnOmitted() {
++            return onOmitted;
++        }
++    }
++
++    public static class BlockPosTickList {
++
++        private final RegionTickManager regionManager;
++        private final Map<TickRegion, Queue<Runnable>> regionTaskMap = Maps.newConcurrentMap();
++
++        private BlockPosTickList(RegionTickManager regionManager) {
++            this.regionManager = regionManager;
++        }
++
++        public void scheduleBlockPosTask(BlockPos pos, Runnable task) {
++            TickRegion tickRegion = this.regionManager.lookupRegion(pos.getX(), pos.getZ());
++            Queue<Runnable> taskQueue = this.regionTaskMap.get(tickRegion);
++            if (taskQueue == null) {
++                taskQueue = Queues.newConcurrentLinkedQueue();
++                this.regionTaskMap.put(tickRegion, taskQueue);
++            }
++            taskQueue.add(task);
++        }
++
++        public void runTasks() throws InterruptedException {
++            Collection<Map.Entry<TickRegion, Queue<Runnable>>> entries = CollectionUtils.immutableCopy(this.regionTaskMap.entrySet());
++            CountDownLatch latch = new CountDownLatch(entries.size());
++            for (Map.Entry<TickRegion, Queue<Runnable>> entry : entries) {
++                Queue<Runnable> tasks = entry.getValue();
++                this.regionManager.runAsync(() -> {
++                    try {
++                        try {
++                            while (!tasks.isEmpty()) {
++                                Runnable task = tasks.remove();
++                                task.run();
++                            }
++                        } catch (Exception e) {
++                            e.printStackTrace();
++                        }
++                    } finally {
++                        latch.countDown();
++                    }
++                });
++            }
++            latch.await();
++        }
++    }
++}
 diff --git a/src/main/java/me/mikex86/velox/tick/region/TickRegion.java b/src/main/java/me/mikex86/velox/tick/region/TickRegion.java
 new file mode 100644
-index 0000000..b3890cb
+index 0000000..ddcd7cd
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/tick/region/TickRegion.java
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,164 @@
 +package me.mikex86.velox.tick.region;
 +
 +import com.google.common.collect.Lists;
@@ -348,6 +970,7 @@ index 0000000..b3890cb
 +
 +    private final Map<ChunkPos, Chunk> chunkMap = Maps.newHashMap();
 +    private final EntityTickList entityTickList = new EntityTickList();
++    private volatile Thread mutatingThread = null;
 +
 +    public boolean addChunk(Chunk chunk) {
 +        return this.chunkMap.put(chunk.getPos(), chunk) == null;
@@ -361,8 +984,24 @@ index 0000000..b3890cb
 +        this.entityTickList.scheduleTick(entity);
 +    }
 +
++    public void setStateMutatingThread() {
++        this.mutatingThread = Thread.currentThread();
++    }
++
 +    public void applyTaskToEntityTickList(Consumer<Entity> entityTask) {
 +        this.entityTickList.performTickListTasks(entityTask);
++    }
++
++    public void resetMutatingThread() {
++        this.mutatingThread = null;
++    }
++
++    public EntityTickList getEntityTickList() {
++        return entityTickList;
++    }
++
++    public Thread getMutatingThread() {
++        return mutatingThread;
 +    }
 +
 +    public boolean containsOrBorders(Chunk chunk) {
@@ -478,362 +1117,15 @@ index 0000000..b3890cb
 +        return this.chunkMap.get(chunkPos);
 +    }
 +}
-diff --git a/src/main/java/me/mikex86/velox/tick/region/TickRegionManager.java b/src/main/java/me/mikex86/velox/tick/region/TickRegionManager.java
-new file mode 100644
-index 0000000..e4d5d04
---- /dev/null
-+++ b/src/main/java/me/mikex86/velox/tick/region/TickRegionManager.java
-@@ -0,0 +1,341 @@
-+package me.mikex86.velox.tick.region;
-+
-+import com.google.common.collect.Lists;
-+import com.google.common.collect.Maps;
-+import com.google.common.collect.Queues;
-+import me.mikex86.velox.utils.CollectionUtils;
-+import net.minecraft.entity.Entity;
-+import net.minecraft.util.math.BlockPos;
-+import net.minecraft.util.math.ChunkPos;
-+import net.minecraft.world.chunk.Chunk;
-+import net.minecraft.world.server.ChunkManager;
-+import net.minecraft.world.server.ServerChunkProvider;
-+
-+import java.util.*;
-+import java.util.concurrent.*;
-+import java.util.concurrent.locks.ReadWriteLock;
-+import java.util.concurrent.locks.ReentrantReadWriteLock;
-+import java.util.function.Consumer;
-+import java.util.function.Predicate;
-+
-+/**
-+ * Creates and destroys regions when chunks are loaded/unloaded.
-+ * <p>
-+ * Delegates tick list building and the scheduling of tasks on those tick lists to the individual regions.
-+ */
-+public class TickRegionManager {
-+
-+    private static final int nThreads = Runtime.getRuntime().availableProcessors();
-+
-+    // TODO: This is only static because multiple TickRegionManager instances can exist that should not have a service on their own claiming every core
-+    // TODO: Config options
-+    private static final ExecutorService service = new ThreadPoolExecutor(nThreads, nThreads,
-+            0L, TimeUnit.MILLISECONDS,
-+            new LinkedBlockingQueue<>(),
-+            new ThreadFactory() {
-+
-+                private int nThreads = 0;
-+
-+                @Override
-+                public Thread newThread(Runnable runnable) {
-+                    Thread thread = new Thread(runnable, "TickWorker-" + nThreads);
-+                    thread.setDaemon(true);
-+                    nThreads++;
-+                    return thread;
-+                }
-+            });
-+
-+    /**
-+     * List containing all existing regions
-+     */
-+    private final List<TickRegion> regionList = Lists.newArrayList();
-+
-+    /**
-+     * Maps the position of chunks to the TickRegion they are part of
-+     */
-+    private final Map<ChunkPos, TickRegion> tickRegionMap = Maps.newHashMap();
-+
-+    /**
-+     * A lock to ensure thread safe access to the TickRegionManager state
-+     */
-+    private final ReadWriteLock lock = new ReentrantReadWriteLock();
-+
-+    /**
-+     * Invoked when a chunk is either loaded or unloaded.
-+     * The method will rebuild regions accordingly.
-+     *
-+     * @param chunk        the chunk that is getting loaded/unloaded
-+     * @param newLoadState the new load state of the chunk. true, if the chunk is getting loaded, false if the chunk is getting unloaded.
-+     */
-+    public void informChunkLoadStateChange(Chunk chunk, boolean newLoadState) {
-+        long start = System.currentTimeMillis();
-+        this.lock.writeLock().lock();
-+        try {
-+            TickRegion chunkDstRegion = this.findRegion(chunk);
-+            if (chunkDstRegion == null) {
-+                chunkDstRegion = createRegion();
-+            }
-+            if (newLoadState) {
-+                boolean modified = addChunkToRegion(chunkDstRegion, chunk);
-+                if (!modified) {
-+                    throw new IllegalStateException("Chunk was already contained in it's region before it was even loaded. This should never happen");
-+                }
-+                // Merge bordering regions:
-+                // Checks if "chunk" borders any region that is not its current region.
-+                // Removes the other region after adding its
-+                // chunks to the region of "chunk"
-+                for (Iterator<TickRegion> iterator = this.regionList.iterator(); iterator.hasNext(); ) {
-+                    TickRegion region = iterator.next();
-+                    if (region == chunkDstRegion) continue;
-+                    if (region.containsOrBorders(chunk)) {
-+                        mergeRegion(chunkDstRegion, region);
-+                        iterator.remove();
-+                    }
-+                }
-+            } else {
-+                boolean modified = chunkDstRegion.removeChunk(chunk);
-+                if (!modified) {
-+                    throw new IllegalStateException("Chunk was already contained in it's region before it was even loaded. This should never happen");
-+                }
-+                if (chunkDstRegion.isEmpty()) {
-+                    removeRegion(chunkDstRegion);
-+                } else {
-+                    checkRegionSplit(chunkDstRegion, chunk);
-+                }
-+            }
-+        } finally {
-+            this.lock.writeLock().unlock();
-+        }
-+        long end = System.currentTimeMillis();
-+        System.out.println("informChunkLoadStateChange(" + newLoadState + ") took: " + (end - start) + " ms; TickRegionManager: " + this);
-+    }
-+
-+    // not thread safe
-+    private void checkRegionSplit(TickRegion region, Chunk unloadedChunk) {
-+        ChunkManager chunkManager = ((ServerChunkProvider) unloadedChunk.getLevel().getChunkSource()).chunkMap;
-+        // Split the region if it is not continuous.
-+        // Check for non continuity by checking if you can travel between
-+        // the neighboring chunks of the chunk that has just been unloaded.
-+        // We will create max. 4 regions in the worst case.
-+
-+        Collection<Chunk> allChunks = region.getChunks();
-+
-+        List<Chunk> neighbors = Lists.newArrayListWithCapacity(4);
-+        region.getNeighbors(true, neighbors, Lists.newArrayList(), unloadedChunk);
-+
-+        assert neighbors.size() == 4;
-+
-+        for (int i = 0; i < neighbors.size() - 1; i++) {
-+            Chunk neighbor1 = neighbors.get(i);
-+            Chunk neighbor2 = neighbors.get(i + 1);
-+            if (neighbor1 == null || neighbor2 == null)
-+                continue;
-+            List<Chunk> chunks = region.floodFillFromChunkUntilChunk(neighbor1, neighbor2);
-+            Chunk lastChunk = chunks.get(chunks.size() - 1);
-+            if (lastChunk != neighbor2) {
-+                // we have not reached the neighboring chunk, the neighbors are in different regions
-+                // if that is the case, "chunks" contains all chunks part of that region, because the flood fill didn't early stop.
-+                if (!chunks.equals(allChunks)) {
-+
-+                    // Create new region with just the "chunks" list.
-+                    // "chunks" may contain chunks that are pending unload.
-+                    // In the worst case scenario, they are all pending unload, eg. on teleport.
-+                    // In that case chunks will unload in basically random order resulting in catastrophically
-+                    // high region complexity for the short time until those regions are deleted.
-+                    // In that case, we don't want to even create a region, thus the initial null value of "newRegion".
-+
-+                    TickRegion newRegion = null;
-+                    for (Chunk chunk : chunks) {
-+                        if (chunkManager.pendingUnloads.containsKey(chunk.getPos().toLong())) {
-+                            // Don't add this chunk to the new region, it is pending unload.
-+                            // We are not yet removing it from the old region: When the chunk
-+                            // is actually unloaded, #informChunkLoadStateChange will be invoked anyways.
-+                            // Ticks might still be performed in those chunks. If we were to remove these from the region now,
-+                            // these ticks could simply not be performed.
-+                            continue;
-+                        }
-+                        // Create the region only then, when we know that at least one
-+                        // chunk actually gets added to it.
-+                        if (newRegion == null) {
-+                            newRegion = createRegion();
-+                        }
-+                        newRegion.addChunk(chunk);
-+                        region.removeChunk(chunk);
-+                        if (region.isEmpty()) {
-+                            removeRegion(region);
-+                        }
-+                        this.tickRegionMap.put(chunk.getPos(), newRegion);
-+                    }
-+                }
-+            }
-+        }
-+    }
-+
-+    public void buildEntityTickList(Iterator<Entity> entityIt, Predicate<Entity> tickingPredicate) {
-+        this.lock.writeLock().lock();
-+        try {
-+            while (entityIt.hasNext()) {
-+                Entity entity = entityIt.next();
-+                if (!tickingPredicate.test(entity)) {
-+                    continue;
-+                }
-+                BlockPos bp = entity.blockPosition();
-+                TickRegion region = this.lookupRegion(bp.getX(), bp.getZ());
-+                if (region == null) {
-+                    // TODO: use a dummy region for these maybe existent edge cases?
-+                    System.err.println("Could not find region for entity: " + entity);
-+                } else {
-+                    region.addToEntityTickList(entity);
-+                }
-+            }
-+        } finally {
-+            this.lock.writeLock().unlock();
-+        }
-+    }
-+
-+    public void applyEntityTask(Consumer<Entity> entityTask) {
-+        this.lock.readLock().lock();
-+        Collection<TickRegion> regionIterable = CollectionUtils.immutableCopy(this.regionList);
-+        this.lock.readLock().unlock();
-+
-+        CountDownLatch latch = new CountDownLatch(regionIterable.size());
-+        for (TickRegion region : regionIterable) {
-+            runAsync(() -> {
-+                try {
-+                    try {
-+                        region.applyTaskToEntityTickList(entityTask);
-+                    } catch (Exception e) {
-+                        e.printStackTrace();
-+                    }
-+                } finally {
-+                    latch.countDown();
-+                }
-+            });
-+        }
-+        try {
-+            latch.await();
-+        } catch (InterruptedException e) {
-+            e.printStackTrace();
-+        }
-+    }
-+
-+    private void runAsync(Runnable task) {
-+        service.execute(task);
-+    }
-+
-+
-+    // not thread safe
-+    private TickRegion lookupRegion(int blockX, int blockZ) {
-+        ChunkPos chunkPos = new ChunkPos(blockX >> 4, blockZ >> 4);
-+        return this.tickRegionMap.get(chunkPos);
-+    }
-+
-+    // not thread safe
-+    private boolean addChunkToRegion(TickRegion region, Chunk chunk) {
-+        this.tickRegionMap.put(chunk.getPos(), region);
-+        return region.addChunk(chunk);
-+    }
-+
-+    /**
-+     * Merges the two regions.
-+     *
-+     * @param dstRegion the region to merge into
-+     * @param srcRegion the region whose chunks should be merged into the other region
-+     */
-+    // not thread safe
-+    private void mergeRegion(TickRegion dstRegion, TickRegion srcRegion) {
-+        dstRegion.merge(srcRegion);
-+        Collection<Chunk> chunks = srcRegion.getChunks();
-+        for (Chunk chunk : chunks) {
-+            this.tickRegionMap.put(chunk.getPos(), dstRegion);
-+        }
-+    }
-+
-+    // not thread safe
-+    private void removeRegion(TickRegion region) {
-+        Collection<Chunk> chunks = region.getChunks();
-+        for (Chunk chunk : chunks) {
-+            this.tickRegionMap.remove(chunk.getPos());
-+        }
-+        this.regionList.remove(region);
-+    }
-+
-+    // not thread safe
-+    private TickRegion createRegion() {
-+        TickRegion region = new TickRegion();
-+        this.regionList.add(region);
-+        return region;
-+    }
-+
-+    // not thread safe
-+    private TickRegion findRegion(Chunk chunk) {
-+        for (TickRegion region : this.regionList) {
-+            if (region.containsOrBorders(chunk)) {
-+                return region;
-+            }
-+        }
-+        return null;
-+    }
-+
-+    @Override
-+    public String toString() {
-+        return "RegionManager{" +
-+                "numRegions=" + this.regionList.size() + ", " +
-+                "regionList=" + this.regionList +
-+                '}';
-+    }
-+
-+    public Chunk getChunk(int x, int z) {
-+        TickRegion region = this.lookupRegion(x, z);
-+        if (region == null)
-+            return null;
-+        return region.getChunk(x, z);
-+    }
-+
-+    public BlockPosTickList newBlockPosTickList() {
-+        return new BlockPosTickList(this);
-+    }
-+
-+    public static class BlockPosTickList {
-+
-+        private final TickRegionManager regionManager;
-+        private final Map<TickRegion, Queue<Runnable>> regionTaskMap = Maps.newConcurrentMap();
-+
-+        private BlockPosTickList(TickRegionManager regionManager) {
-+            this.regionManager = regionManager;
-+        }
-+
-+        public void scheduleBlockPosTask(BlockPos pos, Runnable task) {
-+            TickRegion tickRegion = this.regionManager.lookupRegion(pos.getX(), pos.getZ());
-+            Queue<Runnable> taskQueue = this.regionTaskMap.get(tickRegion);
-+            if (taskQueue == null) {
-+                taskQueue = Queues.newConcurrentLinkedQueue();
-+                this.regionTaskMap.put(tickRegion, taskQueue);
-+            }
-+            taskQueue.add(task);
-+        }
-+
-+        public void runTasks() throws InterruptedException {
-+            Collection<Map.Entry<TickRegion, Queue<Runnable>>> entries = CollectionUtils.immutableCopy(this.regionTaskMap.entrySet());
-+            CountDownLatch latch = new CountDownLatch(entries.size());
-+            for (Map.Entry<TickRegion, Queue<Runnable>> entry : entries) {
-+                Queue<Runnable> tasks = entry.getValue();
-+                this.regionManager.runAsync(() -> {
-+                    try {
-+                        try {
-+                            while (!tasks.isEmpty()) {
-+                                Runnable task = tasks.remove();
-+                                task.run();
-+                            }
-+                        } catch (Exception e) {
-+                            e.printStackTrace();
-+                        }
-+                    } finally {
-+                        latch.countDown();
-+                    }
-+                });
-+            }
-+            latch.await();
-+        }
-+    }
-+}
 diff --git a/src/main/java/me/mikex86/velox/tick/ticklist/block/ConcurrentTickList.java b/src/main/java/me/mikex86/velox/tick/ticklist/block/ConcurrentTickList.java
 new file mode 100644
-index 0000000..9b85f61
+index 0000000..155ab18
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/tick/ticklist/block/ConcurrentTickList.java
 @@ -0,0 +1,37 @@
 +package me.mikex86.velox.tick.ticklist.block;
 +
-+import me.mikex86.velox.tick.region.TickRegionManager;
++import me.mikex86.velox.tick.region.RegionTickManager;
 +import net.minecraft.util.ResourceLocation;
 +import net.minecraft.world.NextTickListEntry;
 +import net.minecraft.world.server.ServerTickList;
@@ -845,12 +1137,12 @@ index 0000000..9b85f61
 +
 +public class ConcurrentTickList<T> extends ServerTickList<T> {
 +
-+    private final TickRegionManager.BlockPosTickList tickList;
++    private final RegionTickManager.BlockPosTickList tickList;
 +
 +    public ConcurrentTickList(ServerWorld p_i231625_1_, Predicate<T> p_i231625_2_, Function<T, ResourceLocation> p_i231625_3_, Consumer<NextTickListEntry<T>> p_i231625_4_) {
 +        super(p_i231625_1_, p_i231625_2_, p_i231625_3_, p_i231625_4_);
-+        TickRegionManager tickRegionManager = p_i231625_1_.tickRegionManager;
-+        this.tickList = tickRegionManager.newBlockPosTickList();
++        RegionTickManager regionTickManager = p_i231625_1_.regionTickManager;
++        this.tickList = regionTickManager.newBlockPosTickList();
 +    }
 +
 +    @Override
@@ -870,16 +1162,19 @@ index 0000000..9b85f61
 +}
 diff --git a/src/main/java/me/mikex86/velox/tick/ticklist/entity/EntityTickList.java b/src/main/java/me/mikex86/velox/tick/ticklist/entity/EntityTickList.java
 new file mode 100644
-index 0000000..7b5757e
+index 0000000..4074c19
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/tick/ticklist/entity/EntityTickList.java
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,43 @@
 +package me.mikex86.velox.tick.ticklist.entity;
 +
++import com.google.common.collect.Queues;
++import it.unimi.dsi.fastutil.ints.IntLinkedOpenHashSet;
++import it.unimi.dsi.fastutil.ints.IntSet;
++import it.unimi.dsi.fastutil.ints.IntSets;
 +import net.minecraft.entity.Entity;
 +
 +import java.util.Queue;
-+import java.util.concurrent.ConcurrentLinkedQueue;
 +import java.util.function.Consumer;
 +
 +/**
@@ -890,19 +1185,29 @@ index 0000000..7b5757e
 + */
 +public class EntityTickList {
 +
-+    private final Queue<Entity> tickList = new ConcurrentLinkedQueue<>();
++    private final Queue<Entity> tickList = Queues.newConcurrentLinkedQueue();
++    private final IntSet entityIds = IntSets.synchronize(new IntLinkedOpenHashSet());
 +
-+    public void scheduleTick(Entity entity) {
++    public synchronized void scheduleTick(Entity entity) {
 +        this.tickList.add(entity);
++        this.entityIds.add(entity.getId());
 +    }
 +
-+    public void performTickListTasks(Consumer<Entity> ticker) {
++    public synchronized void performTickListTasks(Consumer<Entity> ticker) {
 +        while (!this.tickList.isEmpty()) {
 +            Entity entity = this.tickList.remove();
++            this.entityIds.remove(entity.getId());
 +            ticker.accept(entity);
 +        }
 +    }
 +
++    public boolean willTick(int entityId) {
++        return this.entityIds.contains(entityId);
++    }
++
++    public Queue<Entity> getTickListUnsafe() {
++        return tickList;
++    }
 +}
 diff --git a/src/main/java/me/mikex86/velox/utils/ArrayUtils.java b/src/main/java/me/mikex86/velox/utils/ArrayUtils.java
 new file mode 100644
@@ -1567,8 +1872,870 @@ index 0000000..b937350
 +    }
 +
 +}
+diff --git a/src/main/java/me/mikex86/velox/veloxapiimpl/event/EventDispatcher.java b/src/main/java/me/mikex86/velox/veloxapiimpl/event/EventDispatcher.java
+new file mode 100644
+index 0000000..76fb72e
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/veloxapiimpl/event/EventDispatcher.java
+@@ -0,0 +1,59 @@
++package me.mikex86.velox.veloxapiimpl.event;
++
++import com.google.common.collect.Lists;
++import me.mikex86.veloxapi.event.Event;
++import org.jetbrains.annotations.NotNull;
++
++import java.util.List;
++import java.util.function.BiConsumer;
++
++/**
++ * Receives fired events (via {@link #fire(Event)} and invokes all {@link #dispatchingEndpoints} with the events class and the instance.
++ * Invocation of the endpoints is parallelized so no guarantees for execution order.
++ */
++public class EventDispatcher {
++
++    public static EventDispatcher INSTANCE = new EventDispatcher();
++
++    @NotNull
++    private final List<BiConsumer<Class<? extends Event>, Event>> dispatchingEndpoints;
++
++    public EventDispatcher() {
++        this.dispatchingEndpoints = Lists.newCopyOnWriteArrayList();
++    }
++
++    /**
++     * Adds the specified BiConsumer to {@link #dispatchingEndpoints}
++     * Events fired will be dispatched to all endpoints in the list.
++     *
++     * @param endpoint the registry that events should be dispatched to
++     */
++    @SuppressWarnings({"unchecked", "rawtypes"})
++    public <T extends Event> void addDispatchingEndpoint(@NotNull BiConsumer<Class<T>, T> endpoint) {
++        this.dispatchingEndpoints.add((BiConsumer) endpoint);
++    }
++
++    /**
++     * Remove the specified BiConsumer from {@link #dispatchingEndpoints}
++     * The endpoint will no longer be invoked by the dispatcher when the dispatching of any currently fired event completes.
++     *
++     * @param endpoint the registry that events should be dispatched to
++     */
++    @SuppressWarnings({"rawtypes"})
++    public <T extends Event> void removeDispatchingEndpoint(@NotNull BiConsumer<Class<T>, T> endpoint) {
++        this.dispatchingEndpoints.remove((BiConsumer) endpoint);
++    }
++
++    /**
++     * Called to dispatch events to all {@link #dispatchingEndpoints}
++     *
++     * @param event the event instance fired
++     */
++    @SuppressWarnings({"unchecked"})
++    public <T extends Event> void fire(@NotNull T event) {
++        Class<T> eventClass = (Class<T>) event.getClass();
++        this.dispatchingEndpoints.parallelStream().forEach(registry -> registry.accept(eventClass, event));
++    }
++
++
++}
+diff --git a/src/main/java/me/mikex86/velox/veloxapiimpl/listener/VeloxEventListenerRegistry.java b/src/main/java/me/mikex86/velox/veloxapiimpl/listener/VeloxEventListenerRegistry.java
+new file mode 100644
+index 0000000..813e790
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/veloxapiimpl/listener/VeloxEventListenerRegistry.java
+@@ -0,0 +1,84 @@
++package me.mikex86.velox.veloxapiimpl.listener;
++
++import com.google.common.collect.Maps;
++import com.google.common.collect.Queues;
++import me.mikex86.veloxapi.event.Event;
++import me.mikex86.veloxapi.event.EventListener;
++import me.mikex86.veloxapi.event.EventListenerRegistry;
++import me.mikex86.veloxapi.event.exception.ListenerRegistrationException;
++import org.jetbrains.annotations.NotNull;
++
++import java.util.Map;
++import java.util.Queue;
++
++public class VeloxEventListenerRegistry implements EventListenerRegistry {
++
++    private final Map<Class<? extends Event>, Queue<EventListenerEntry<? extends Event>>> listenerMap = Maps.newConcurrentMap();
++    private final Map<EventListener<? extends Event>, Class<? extends Event>> registeredListeners = Maps.newConcurrentMap();
++
++    @Override
++    public synchronized <T extends Event> void registerListener(@NotNull EventListener<T> eventListener, @NotNull Class<T> eventClass, @NotNull EventListener.Priority requestedPriority) {
++        if (this.registeredListeners.containsKey(eventListener)) {
++            throw new ListenerRegistrationException("Listener already registered!");
++        }
++        Queue<EventListenerEntry<T>> listeners = retrieveEventListeners(eventClass);
++        listeners.add(new EventListenerEntry<>(eventListener, requestedPriority));
++        this.registeredListeners.put(eventListener, eventClass);
++    }
++
++    @Override
++    public synchronized <T extends Event> void unregisterListener(@NotNull EventListener<T> eventListener) throws ListenerRegistrationException {
++        if (!this.registeredListeners.containsKey(eventListener)) {
++            throw new ListenerRegistrationException("Listener was never registered!");
++        }
++        Class<? extends Event> eventClazz = this.registeredListeners.get(eventListener);
++        Queue<? extends EventListenerEntry<? extends Event>> listeners = retrieveEventListeners(eventClazz);
++        listeners.removeIf(entry -> entry.getEventListener() == eventListener);
++        this.registeredListeners.remove(eventListener);
++    }
++
++    /**
++     * Retrieves the event listeners for the specified event class and creates a new list for that class if none exists.
++     */
++    @NotNull
++    @SuppressWarnings({"unchecked", "rawtypes"})
++    private <T extends Event> Queue<EventListenerEntry<T>> retrieveEventListeners(Class<T> eventClazz) {
++        Queue<EventListenerEntry<T>> listeners = (Queue) this.listenerMap.get(eventClazz);
++        if (listeners == null) {
++            listeners = Queues.newPriorityBlockingQueue();
++            this.listenerMap.put(eventClazz, (Queue) listeners);
++        }
++        return listeners;
++    }
++
++    @SuppressWarnings({"unchecked", "rawtypes"})
++    public <T extends Event> void invokeListeners(Class<T> eventClazz, T event) {
++        Queue<EventListenerEntry<T>> listenerEntries = (Queue) this.listenerMap.get(eventClazz);
++        listenerEntries.parallelStream().forEach(entry -> entry.getEventListener().onEvent(event));
++    }
++
++    private static class EventListenerEntry<T extends Event> implements Comparable<EventListenerEntry<T>> {
++
++        private final EventListener<T> eventListener;
++        private final EventListener.Priority priority;
++
++        public EventListenerEntry(EventListener<T> eventListener, EventListener.Priority priority) {
++            this.eventListener = eventListener;
++            this.priority = priority;
++        }
++
++        public EventListener<T> getEventListener() {
++            return eventListener;
++        }
++
++        public EventListener.Priority getPriority() {
++            return priority;
++        }
++
++        @Override
++        public int compareTo(@NotNull VeloxEventListenerRegistry.EventListenerEntry<T> o) {
++            return Integer.compare(this.priority.getPriorityValue(), o.getPriority().getPriorityValue());
++        }
++    }
++
++}
+diff --git a/src/main/java/me/mikex86/velox/veloxapiimpl/plugin/VeloxPlugin.java b/src/main/java/me/mikex86/velox/veloxapiimpl/plugin/VeloxPlugin.java
+new file mode 100644
+index 0000000..b6a904f
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/veloxapiimpl/plugin/VeloxPlugin.java
+@@ -0,0 +1,53 @@
++package me.mikex86.velox.veloxapiimpl.plugin;
++
++import me.mikex86.velox.veloxapiimpl.event.EventDispatcher;
++import me.mikex86.velox.veloxapiimpl.listener.VeloxEventListenerRegistry;
++import me.mikex86.velox.veloxapiimpl.plugin.exception.PluginLoadStateException;
++import me.mikex86.veloxapi.plugin.JvmPlugin;
++import me.mikex86.veloxapi.event.Event;
++import org.jetbrains.annotations.NotNull;
++
++import java.util.function.BiConsumer;
++
++public class VeloxPlugin {
++
++    @NotNull
++    private final JvmPlugin jvmPlugin;
++
++    @NotNull
++    private final VeloxEventListenerRegistry listenerRegistry;
++
++    private boolean enabled = false;
++
++    private final BiConsumer<Class<Event>, Event> eventEndpoint;
++
++
++    public VeloxPlugin(@NotNull JvmPlugin jvmPlugin) {
++        this.jvmPlugin = jvmPlugin;
++        this.listenerRegistry = new VeloxEventListenerRegistry();
++        this.eventEndpoint = this.listenerRegistry::invokeListeners;
++    }
++
++    public synchronized void enable() {
++        if (this.enabled) {
++            throw new PluginLoadStateException("Plugin is already enabled!");
++        }
++        this.enabled = true;
++        EventDispatcher.INSTANCE.addDispatchingEndpoint(this.eventEndpoint);
++    }
++
++    public synchronized void disable() {
++        if (!this.enabled) {
++            throw new PluginLoadStateException("Plugin is already disabled!");
++        }
++        this.enabled = false;
++        EventDispatcher.INSTANCE.removeDispatchingEndpoint(this.eventEndpoint);
++    }
++
++    public synchronized void initialize() {
++        if (!this.enabled) {
++            throw new PluginLoadStateException("Cannot initialize disabled plugin");
++        }
++        this.jvmPlugin.initListeners(this.listenerRegistry);
++    }
++}
+diff --git a/src/main/java/me/mikex86/velox/veloxapiimpl/plugin/VeloxPluginLoader.java b/src/main/java/me/mikex86/velox/veloxapiimpl/plugin/VeloxPluginLoader.java
+new file mode 100644
+index 0000000..da31539
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/veloxapiimpl/plugin/VeloxPluginLoader.java
+@@ -0,0 +1,125 @@
++package me.mikex86.velox.veloxapiimpl.plugin;
++
++import com.google.common.collect.Lists;
++import com.google.gson.*;
++import me.mikex86.velox.veloxapiimpl.plugin.exception.PluginLoaderException;
++import me.mikex86.veloxapi.plugin.JvmPlugin;
++import org.apache.logging.log4j.Level;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++import org.jetbrains.annotations.NotNull;
++
++import java.io.File;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.InputStreamReader;
++import java.lang.reflect.Constructor;
++import java.lang.reflect.InvocationTargetException;
++import java.net.URL;
++import java.net.URLClassLoader;
++import java.util.List;
++
++public class VeloxPluginLoader {
++
++    @NotNull
++    private static final Logger LOGGER = LogManager.getLogger();
++
++    @NotNull
++    private final File pluginsFolder = new File("plugins");
++
++    @NotNull
++    private final Gson gson = new GsonBuilder()
++            .setPrettyPrinting()
++            .create();
++
++    @NotNull
++    private final List<VeloxPlugin> enabledPlugins = Lists.newCopyOnWriteArrayList();
++
++    @SuppressWarnings("ResultOfMethodCallIgnored")
++    public void loadPlugins() {
++        this.pluginsFolder.mkdirs();
++        File[] plugins = this.pluginsFolder.listFiles();
++        if (plugins == null) {
++            return;
++        }
++        for (File pluginFile : plugins) {
++            if (pluginFile.isFile() && pluginFile.getName().endsWith(".jar")) {
++                try {
++                    URLClassLoader pluginClassLoader = new URLClassLoader(
++                            new URL[]{pluginFile.toURI().toURL()},
++                            getClass().getClassLoader()
++                    );
++                    JvmPlugin plugin = this.loadPlugin(pluginClassLoader);
++                    VeloxPlugin veloxPlugin = new VeloxPlugin(plugin);
++                    this.initializePlugin(veloxPlugin);
++                    LOGGER.info("Successfully loaded plugin: \"" + pluginFile.getName() + "\"");
++                } catch (Exception e) {
++                    LOGGER.log(Level.ERROR, "Cannot load plugin: " + pluginFile.getName(), e);
++                }
++            }
++        }
++        LOGGER.info("Loaded " + this.enabledPlugins.size() + " plugins!");
++    }
++
++    private void initializePlugin(@NotNull VeloxPlugin plugin) {
++        this.enablePlugin(plugin);
++        plugin.initialize();
++    }
++
++    private void enablePlugin(@NotNull VeloxPlugin plugin) {
++        plugin.enable();
++        this.enabledPlugins.add(plugin);
++    }
++
++    private void disablePlugin(@NotNull VeloxPlugin plugin) {
++        plugin.disable();
++        this.enabledPlugins.remove(plugin);
++    }
++
++    public void disableAllLoadedPlugins() {
++        for (VeloxPlugin plugin : this.enabledPlugins) {
++            this.disablePlugin(plugin);
++        }
++    }
++
++    @NotNull
++    private JvmPlugin loadPlugin(@NotNull URLClassLoader classLoader) throws IOException {
++        try (InputStream stream = classLoader.getResourceAsStream("plugin.json")) {
++            if (stream == null) {
++                throw new PluginLoaderException("\"plugin.json\" not found in plugin jar");
++            }
++            JsonObject jsonObject = this.gson.fromJson(new InputStreamReader(stream), JsonObject.class);
++            JsonElement pluginClassElement = jsonObject.get("pluginClass");
++            if (pluginClassElement == null) {
++                throw new PluginLoaderException("\"plugin.json\" does not define \"pluginClass\" element");
++            }
++            if (!(pluginClassElement instanceof JsonPrimitive)) {
++                throw new PluginLoaderException("\"pluginClass\" defined in \"plugin.json\" must be a json primitive!");
++            }
++            String pluginClassName = pluginClassElement.getAsString();
++            Class<?> pluginClass;
++            try {
++                pluginClass = Class.forName(pluginClassName, true, classLoader);
++            } catch (ClassNotFoundException e) {
++                throw new PluginLoaderException("The class \"" + pluginClassName + "\" set as \"pluginClass\" defined in \"plugin.json\" does not exist");
++            }
++            Constructor<?> constructor;
++            try {
++                constructor = pluginClass.getConstructor();
++            } catch (NoSuchMethodException e) {
++                throw new PluginLoaderException("The class \"" + pluginClassName + "\" set as \"pluginClass\" defined in \"plugin.json\" does not define an empty constructor!");
++            }
++            Object instance;
++            try {
++                instance = constructor.newInstance();
++            } catch (InstantiationException | IllegalAccessException | InvocationTargetException e) {
++                throw new PluginLoaderException("The class \"" + pluginClassName + "\" set as \"pluginClass\" defined in \"plugin.json\" could not be instanced.", e);
++            }
++            if (!(instance instanceof JvmPlugin)) {
++                throw new PluginLoaderException("The class \"" + pluginClassName + "\" set as \"pluginClass\" defined in \"plugin.json\" does not inherit from JvmPlugin!");
++            }
++            return (JvmPlugin) instance;
++        }
++    }
++
++}
+diff --git a/src/main/java/me/mikex86/velox/veloxapiimpl/plugin/exception/PluginLoadStateException.java b/src/main/java/me/mikex86/velox/veloxapiimpl/plugin/exception/PluginLoadStateException.java
+new file mode 100644
+index 0000000..987abea
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/veloxapiimpl/plugin/exception/PluginLoadStateException.java
+@@ -0,0 +1,19 @@
++package me.mikex86.velox.veloxapiimpl.plugin.exception;
++
++/**
++ * Thrown when plugin load state errors arise
++ */
++public class PluginLoadStateException extends RuntimeException {
++
++    public PluginLoadStateException(String message) {
++        super(message);
++    }
++
++    public PluginLoadStateException(String message, Throwable cause) {
++        super(message, cause);
++    }
++
++    public PluginLoadStateException(Throwable cause) {
++        super(cause);
++    }
++}
+diff --git a/src/main/java/me/mikex86/velox/veloxapiimpl/plugin/exception/PluginLoaderException.java b/src/main/java/me/mikex86/velox/veloxapiimpl/plugin/exception/PluginLoaderException.java
+new file mode 100644
+index 0000000..ab964a0
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/veloxapiimpl/plugin/exception/PluginLoaderException.java
+@@ -0,0 +1,19 @@
++package me.mikex86.velox.veloxapiimpl.plugin.exception;
++
++/**
++ * Thrown when plugin loading fails.
++ */
++public class PluginLoaderException extends RuntimeException {
++
++    public PluginLoaderException(String message) {
++        super(message);
++    }
++
++    public PluginLoaderException(String message, Throwable cause) {
++        super(message, cause);
++    }
++
++    public PluginLoaderException(Throwable cause) {
++        super(cause);
++    }
++}
+diff --git a/src/main/java/me/mikex86/velox/veloxapiimpl/server/VeloxServer.java b/src/main/java/me/mikex86/velox/veloxapiimpl/server/VeloxServer.java
+new file mode 100644
+index 0000000..eba2d90
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/veloxapiimpl/server/VeloxServer.java
+@@ -0,0 +1,52 @@
++package me.mikex86.velox.veloxapiimpl.server;
++
++import com.mojang.authlib.GameProfileRepository;
++import com.mojang.authlib.minecraft.MinecraftSessionService;
++import com.mojang.datafixers.DataFixer;
++import me.mikex86.velox.veloxapiimpl.plugin.VeloxPluginLoader;
++import net.minecraft.resources.DataPackRegistries;
++import net.minecraft.resources.ResourcePackList;
++import net.minecraft.server.ServerPropertiesProvider;
++import net.minecraft.server.dedicated.DedicatedServer;
++import net.minecraft.server.management.PlayerProfileCache;
++import net.minecraft.util.registry.DynamicRegistries;
++import net.minecraft.world.chunk.listener.IChunkStatusListenerFactory;
++import net.minecraft.world.storage.IServerConfiguration;
++import net.minecraft.world.storage.SaveFormat;
++
++import java.io.IOException;
++import java.util.Objects;
++
++public class VeloxServer extends DedicatedServer {
++
++    private static VeloxServer instance;
++    private final VeloxPluginLoader pluginLoader = new VeloxPluginLoader();
++
++    public VeloxServer(Thread p_i232601_1_, DynamicRegistries.Impl p_i232601_2_, SaveFormat.LevelSave p_i232601_3_, ResourcePackList p_i232601_4_, DataPackRegistries p_i232601_5_, IServerConfiguration p_i232601_6_, ServerPropertiesProvider p_i232601_7_, DataFixer p_i232601_8_, MinecraftSessionService p_i232601_9_, GameProfileRepository p_i232601_10_, PlayerProfileCache p_i232601_11_, IChunkStatusListenerFactory p_i232601_12_) {
++        super(p_i232601_1_, p_i232601_2_, p_i232601_3_, p_i232601_4_, p_i232601_5_, p_i232601_6_, p_i232601_7_, p_i232601_8_, p_i232601_9_, p_i232601_10_, p_i232601_11_, p_i232601_12_);
++        if (instance != null) {
++            throw new IllegalStateException("Two server instances cannot exist!");
++        }
++        instance = this;
++    }
++
++    @Override
++    public boolean initServer() throws IOException {
++        boolean initServer = super.initServer();
++        if (!initServer) {
++            return false;
++        }
++        this.pluginLoader.loadPlugins();
++        return true;
++    }
++
++    @Override
++    public void stopServer() {
++        this.pluginLoader.disableAllLoadedPlugins();
++        super.stopServer();
++    }
++
++    public static VeloxServer getInstance() {
++        return Objects.requireNonNull(instance, "Global server instance not yet initialized!");
++    }
++}
+diff --git a/src/main/java/me/mikex86/veloxapi/event/Event.java b/src/main/java/me/mikex86/veloxapi/event/Event.java
+new file mode 100644
+index 0000000..1d54157
+--- /dev/null
++++ b/src/main/java/me/mikex86/veloxapi/event/Event.java
+@@ -0,0 +1,7 @@
++package me.mikex86.veloxapi.event;
++
++/**
++ * Marker interface for event types.
++ */
++public interface Event {
++}
+diff --git a/src/main/java/me/mikex86/veloxapi/event/EventListener.java b/src/main/java/me/mikex86/veloxapi/event/EventListener.java
+new file mode 100644
+index 0000000..a0948f9
+--- /dev/null
++++ b/src/main/java/me/mikex86/veloxapi/event/EventListener.java
+@@ -0,0 +1,40 @@
++package me.mikex86.veloxapi.event;
++
++import org.jetbrains.annotations.NotNull;
++
++/**
++ * @param <T> the type of event the veloxapi.listener listens to
++ */
++public interface EventListener<T extends Event> {
++
++    /**
++     * Called when an event of the specified type is fired.
++     *
++     * @param event the event instance fired.
++     *              No guarantees about the identity or lifecycle of any event instance are being made.
++     */
++    void onEvent(@NotNull T event);
++
++    /**
++     * Represents the priority of execution for an EventListener.
++     *
++     * @see EventListenerRegistry
++     */
++    enum Priority {
++
++        LOW(-1), NORMAL(0), HIGH(1);
++
++        /**
++         * A numeric representation of a {@link Priority} enum constant
++         */
++        private final int priorityValue;
++
++        Priority(int priorityValue) {
++            this.priorityValue = priorityValue;
++        }
++
++        public int getPriorityValue() {
++            return priorityValue;
++        }
++    }
++}
+diff --git a/src/main/java/me/mikex86/veloxapi/event/EventListenerRegistry.java b/src/main/java/me/mikex86/veloxapi/event/EventListenerRegistry.java
+new file mode 100644
+index 0000000..b98f2b6
+--- /dev/null
++++ b/src/main/java/me/mikex86/veloxapi/event/EventListenerRegistry.java
+@@ -0,0 +1,54 @@
++package me.mikex86.veloxapi.event;
++
++import me.mikex86.veloxapi.event.exception.ListenerRegistrationException;
++import org.jetbrains.annotations.NotNull;
++
++/**
++ * Registry for event listeners.
++ * The registry is queried when an event is fired to determine which listeners should be invoked when the given
++ * even is fired in which order.
++ * Listeners only listen to the event types they are registered to be invoked with.
++ * An invocation priority for a veloxapi.listener can be requested, but no guarantees about the order of execution of the event
++ * listeners are made.
++ */
++public interface EventListenerRegistry {
++
++    /**
++     * Registers an event veloxapi.listener with normal priority.
++     * A veloxapi.listener instance cannot be registered twice.
++     * Listeners are NOT guaranteed to be invoked on the thread that fired it.
++     *
++     * @param eventListener the event veloxapi.listener to register.
++     * @param eventClass    the class of the event the veloxapi.listener listens to
++     * @param <T>           the type of event the event veloxapi.listener expects, as determined by eventClass
++     * @throws ListenerRegistrationException if the veloxapi.listener instance is already registered
++     */
++    default <T extends Event> void registerListener(@NotNull EventListener<T> eventListener, @NotNull Class<T> eventClass) throws ListenerRegistrationException {
++        registerListener(eventListener, eventClass, EventListener.Priority.NORMAL);
++    }
++
++    /**
++     * Registers an event veloxapi.listener with a specific priority.
++     * A veloxapi.listener instance cannot be registered twice.
++     * Listeners are NOT guaranteed to be invoked on the thread that fired it.
++     *
++     * @param eventListener     the event veloxapi.listener to register.
++     * @param eventClass        the class of the event the veloxapi.listener listens to
++     * @param requestedPriority he priority of execution for the veloxapi.listener.
++     * @param <T>               the type of event the event veloxapi.listener expects, as determined by eventClass.
++     *                          An invocation priority for a veloxapi.listener can be requested, but no guarantees about the order of execution of the event
++     *                          listeners are made because of parallelization.
++     * @throws ListenerRegistrationException if the veloxapi.listener instance is already registered
++     */
++    <T extends Event> void registerListener(@NotNull EventListener<T> eventListener, @NotNull Class<T> eventClass, @NotNull EventListener.Priority requestedPriority) throws ListenerRegistrationException;
++
++    /**
++     * Unregisters a given event veloxapi.listener instance.
++     *
++     * @param eventListener the veloxapi.listener to unregister
++     * @param <T>           the type of event the veloxapi.listener listens to
++     * @throws ListenerRegistrationException if the veloxapi.listener is not registered
++     */
++    <T extends Event> void unregisterListener(@NotNull EventListener<T> eventListener) throws ListenerRegistrationException;
++
++}
+diff --git a/src/main/java/me/mikex86/veloxapi/event/exception/ListenerRegistrationException.java b/src/main/java/me/mikex86/veloxapi/event/exception/ListenerRegistrationException.java
+new file mode 100644
+index 0000000..5ede5b7
+--- /dev/null
++++ b/src/main/java/me/mikex86/veloxapi/event/exception/ListenerRegistrationException.java
+@@ -0,0 +1,21 @@
++package me.mikex86.veloxapi.event.exception;
++
++import org.jetbrains.annotations.NotNull;
++
++/**
++ * Thrown when registration/un-registration of a veloxapi.listener fails
++ */
++public class ListenerRegistrationException extends RuntimeException {
++
++    public ListenerRegistrationException(@NotNull String message) {
++        super(message);
++    }
++
++    public ListenerRegistrationException(@NotNull String message, @NotNull Throwable cause) {
++        super(message, cause);
++    }
++
++    public ListenerRegistrationException(@NotNull Throwable cause) {
++        super(cause);
++    }
++}
+diff --git a/src/main/java/me/mikex86/veloxapi/event/impl/PlayerChatEvent.java b/src/main/java/me/mikex86/veloxapi/event/impl/PlayerChatEvent.java
+new file mode 100644
+index 0000000..d92b0e4
+--- /dev/null
++++ b/src/main/java/me/mikex86/veloxapi/event/impl/PlayerChatEvent.java
+@@ -0,0 +1,30 @@
++package me.mikex86.veloxapi.event.impl;
++
++import me.mikex86.veloxapi.event.Event;
++import me.mikex86.veloxapi.threading.EntityThreadGuard;
++import net.minecraft.entity.player.ServerPlayerEntity;
++import org.jetbrains.annotations.NotNull;
++
++public class PlayerChatEvent implements Event {
++
++    @NotNull
++    private final String message;
++
++    @NotNull
++    private final EntityThreadGuard<ServerPlayerEntity> sender;
++
++    public PlayerChatEvent(@NotNull String message, @NotNull ServerPlayerEntity sender) {
++        this.message = message;
++        this.sender = new EntityThreadGuard<>(sender);
++    }
++
++    @NotNull
++    public String getMessage() {
++        return message;
++    }
++
++    @NotNull
++    public EntityThreadGuard<ServerPlayerEntity> getSender() {
++        return sender;
++    }
++}
+diff --git a/src/main/java/me/mikex86/veloxapi/game/GameTick.java b/src/main/java/me/mikex86/veloxapi/game/GameTick.java
+new file mode 100644
+index 0000000..b7ed9ee
+--- /dev/null
++++ b/src/main/java/me/mikex86/veloxapi/game/GameTick.java
+@@ -0,0 +1,55 @@
++package me.mikex86.veloxapi.game;
++
++import me.mikex86.velox.tick.global.WorldTickManager;
++import me.mikex86.velox.tick.region.RegionTickManager;
++import me.mikex86.veloxapi.region.Region;
++import me.mikex86.veloxapi.threading.EntityThreadGuard;
++import me.mikex86.veloxapi.threading.WorldThreadGuard;
++import net.minecraft.entity.Entity;
++import net.minecraft.world.World;
++import org.jetbrains.annotations.NotNull;
++
++import java.util.Objects;
++import java.util.function.Consumer;
++
++/**
++ * Utility to interact with the minecraft game
++ */
++public class GameTick {
++
++    private static final Runnable EMPTY_RUNNABLE = () -> {
++    };
++
++    public static void runEntityTickTaskInRegion(@NotNull EntityThreadGuard<? extends Entity> entity, @NotNull Runnable task, @NotNull Runnable onOmitted) {
++        RegionTickManager regionManager = WorldTickManager.getWorldRegionTickManager(entity.getWorldId());
++        Objects.requireNonNull(regionManager, "No region manager defined for world id: " + entity.getWorldId());
++        regionManager.runEntityTaskInRegion(entity.getEntityId(), task, onOmitted);
++    }
++
++    public static void runEntityTickTaskInRegion(@NotNull EntityThreadGuard<? extends Entity> entity, @NotNull Runnable task) {
++        runEntityTickTaskInRegion(entity, task, EMPTY_RUNNABLE);
++    }
++
++    public static void runTaskInAllRegionsInWorld(@NotNull WorldThreadGuard<? extends World> world, @NotNull Consumer<Region> task) {
++        RegionTickManager regionManager = WorldTickManager.getWorldRegionTickManager(world.getWorldId());
++        Objects.requireNonNull(regionManager, "No region manager defined for world id: " + world.getWorldId());
++        regionManager.runTaskInAllRegions(task);
++    }
++
++    public static void runTaskInWorld(@NotNull WorldThreadGuard<? extends World> world, @NotNull Consumer<World> task) {
++        WorldTickManager.runGlobalTask(world, () -> {
++            World value = world.getValue();
++            task.accept(value);
++        });
++    }
++
++    public static boolean isThreadAuthorizedForRegion(@NotNull EntityThreadGuard<? extends Entity> entity, @NotNull Thread thread) {
++        RegionTickManager regionManager = WorldTickManager.getWorldRegionTickManager(entity.getWorldId());
++        Objects.requireNonNull(regionManager, "No region manager defined for world id: " + entity.getWorldId());
++        return regionManager.isMutationAllowed(entity, thread);
++    }
++
++    public static boolean isThreadAuthorizedForGlobalAccess(@NotNull WorldThreadGuard<? extends World> world, @NotNull Thread thread) {
++        return WorldTickManager.hasThreadGlobalMutationAccess(world, thread);
++    }
++}
+diff --git a/src/main/java/me/mikex86/veloxapi/plugin/JvmPlugin.java b/src/main/java/me/mikex86/veloxapi/plugin/JvmPlugin.java
+new file mode 100644
+index 0000000..91bc406
+--- /dev/null
++++ b/src/main/java/me/mikex86/veloxapi/plugin/JvmPlugin.java
+@@ -0,0 +1,19 @@
++package me.mikex86.veloxapi.plugin;
++
++import me.mikex86.veloxapi.event.EventListenerRegistry;
++import org.jetbrains.annotations.NotNull;
++
++/**
++ * Interface for plugins written in a JVM language.
++ */
++public interface JvmPlugin {
++
++    /**
++     * The plugin should register its event listeners in this context.
++     *
++     * @param registry allows a plugin to register event listeners.
++     *                 When an event is fired, the listeners registered to listen to the given event type will be invoked.
++     */
++    void initListeners(@NotNull EventListenerRegistry registry);
++
++}
+diff --git a/src/main/java/me/mikex86/veloxapi/region/Region.java b/src/main/java/me/mikex86/veloxapi/region/Region.java
+new file mode 100644
+index 0000000..81fb8bf
+--- /dev/null
++++ b/src/main/java/me/mikex86/veloxapi/region/Region.java
+@@ -0,0 +1,17 @@
++package me.mikex86.veloxapi.region;
++
++import net.minecraft.entity.Entity;
++import org.jetbrains.annotations.NotNull;
++
++/**
++ * Represents a region of independent, loaded chunks that do not border any loaded other chunks.
++ */
++public interface Region {
++
++    /**
++     * @return an iterable of the entities of the region.
++     */
++    @NotNull
++    Iterable<Entity> entities();
++
++}
+diff --git a/src/main/java/me/mikex86/veloxapi/threading/EntityThreadGuard.java b/src/main/java/me/mikex86/veloxapi/threading/EntityThreadGuard.java
+new file mode 100644
+index 0000000..46b761e
+--- /dev/null
++++ b/src/main/java/me/mikex86/veloxapi/threading/EntityThreadGuard.java
+@@ -0,0 +1,40 @@
++package me.mikex86.veloxapi.threading;
++
++import me.mikex86.veloxapi.game.GameTick;
++import me.mikex86.veloxapi.threading.exception.ThreadContextException;
++import net.minecraft.entity.Entity;
++import net.minecraft.util.math.BlockPos;
++import org.jetbrains.annotations.NotNull;
++
++public class EntityThreadGuard<T extends Entity> implements ThreadGuard<T> {
++
++    @NotNull
++    private final T value;
++
++    public EntityThreadGuard(@NotNull T value) {
++        this.value = value;
++    }
++
++    @NotNull
++    @Override
++    public T getValue() {
++        Thread thread = Thread.currentThread();
++        if (!GameTick.isThreadAuthorizedForRegion(this, thread)) {
++            throw new ThreadContextException("Cannot access guarded value from unauthorized thread.");
++        }
++        return value;
++    }
++
++    public int getEntityId() {
++        return value.getId();
++    }
++
++    public int getWorldId() {
++        // This is unique as World does not override it.
++        return value.level.getWorldId();
++    }
++
++    public BlockPos getWeaklyConsistentPosition() {
++        return value.blockPosition();
++    }
++}
+diff --git a/src/main/java/me/mikex86/veloxapi/threading/ThreadGuard.java b/src/main/java/me/mikex86/veloxapi/threading/ThreadGuard.java
+new file mode 100644
+index 0000000..ae08e39
+--- /dev/null
++++ b/src/main/java/me/mikex86/veloxapi/threading/ThreadGuard.java
+@@ -0,0 +1,10 @@
++package me.mikex86.veloxapi.threading;
++
++import org.jetbrains.annotations.NotNull;
++
++public interface ThreadGuard<T> {
++
++    @NotNull
++    T getValue();
++
++}
+diff --git a/src/main/java/me/mikex86/veloxapi/threading/WorldThreadGuard.java b/src/main/java/me/mikex86/veloxapi/threading/WorldThreadGuard.java
+new file mode 100644
+index 0000000..ee36770
+--- /dev/null
++++ b/src/main/java/me/mikex86/veloxapi/threading/WorldThreadGuard.java
+@@ -0,0 +1,31 @@
++package me.mikex86.veloxapi.threading;
++
++import me.mikex86.veloxapi.game.GameTick;
++import me.mikex86.veloxapi.threading.exception.ThreadContextException;
++import net.minecraft.world.World;
++import org.jetbrains.annotations.NotNull;
++
++public class WorldThreadGuard<T extends World> implements ThreadGuard<T> {
++
++    @NotNull
++    private final T value;
++
++    public WorldThreadGuard(@NotNull T value) {
++        this.value = value;
++    }
++
++    @NotNull
++    @Override
++    public T getValue() {
++        Thread thread = Thread.currentThread();
++        if (!GameTick.isThreadAuthorizedForGlobalAccess(this, thread)) {
++            throw new ThreadContextException("Cannot access guarded value from unauthorized thread.");
++        }
++        return this.value;
++    }
++
++    public int getWorldId() {
++        return this.value.getWorldId();
++    }
++
++}
+diff --git a/src/main/java/me/mikex86/veloxapi/threading/exception/ThreadContextException.java b/src/main/java/me/mikex86/veloxapi/threading/exception/ThreadContextException.java
+new file mode 100644
+index 0000000..2b6cced
+--- /dev/null
++++ b/src/main/java/me/mikex86/veloxapi/threading/exception/ThreadContextException.java
+@@ -0,0 +1,13 @@
++package me.mikex86.veloxapi.threading.exception;
++
++import org.jetbrains.annotations.NotNull;
++
++/**
++ * Thrown when an operation is performed that is illegal from the calling thread
++ */
++public class ThreadContextException extends RuntimeException {
++
++    public ThreadContextException(@NotNull String message) {
++        super(message);
++    }
++}
 diff --git a/build/mcp_diff_src/net/minecraft/advancements/criterion/AbstractCriterionTrigger.java b/src/main/java/net/minecraft/advancements/criterion/AbstractCriterionTrigger.java
-index 0df6360..4fdaf7e 100644
+index 0df6360..5a35f0c 100644
 --- a/build/mcp_diff_src/net/minecraft/advancements/criterion/AbstractCriterionTrigger.java
 +++ b/src/main/java/net/minecraft/advancements/criterion/AbstractCriterionTrigger.java
 @@ -15,11 +15,15 @@ import net.minecraft.loot.ConditionArrayParser;
@@ -1583,7 +2750,7 @@ index 0df6360..4fdaf7e 100644
     public final void addPlayerListener(PlayerAdvancements p_192165_1_, ICriterionTrigger.Listener<T> p_192165_2_) {
        this.players.computeIfAbsent(p_192165_1_, (p_227072_0_) -> {
 -         return Sets.newHashSet();
-+         // Velox start: players advancement map trigger listener set threadsafe
++         // Velox start: players advancement map trigger veloxapi.listener set threadsafe
 +         return Sets.newConcurrentHashSet();
 +         // Velox end
        }).add(p_192165_2_);
@@ -1690,6 +2857,31 @@ index 339b18a..1a31073 100644
     private final PlayerAdvancements advancements;
     private final ServerStatisticsManager stats;
     private float lastRecordedHealthAndAbsorption = Float.MIN_VALUE;
+diff --git a/build/mcp_diff_src/net/minecraft/network/play/ServerPlayNetHandler.java b/src/main/java/net/minecraft/network/play/ServerPlayNetHandler.java
+index 7f165cd..a25d623 100644
+--- a/build/mcp_diff_src/net/minecraft/network/play/ServerPlayNetHandler.java
++++ b/src/main/java/net/minecraft/network/play/ServerPlayNetHandler.java
+@@ -19,6 +19,9 @@ import java.util.function.Consumer;
+ import java.util.stream.Collectors;
+ import java.util.stream.Stream;
+ import javax.annotation.Nullable;
++
++import me.mikex86.velox.veloxapiimpl.event.EventDispatcher;
++import me.mikex86.veloxapi.event.impl.PlayerChatEvent;
+ import net.minecraft.advancements.Advancement;
+ import net.minecraft.advancements.CriteriaTriggers;
+ import net.minecraft.block.AbstractBlock;
+@@ -1093,7 +1096,9 @@ public class ServerPlayNetHandler implements IServerPlayNetHandler {
+                return;
+             }
+          }
+-
++         // Velox start: fire PlayerChatEvent
++         EventDispatcher.INSTANCE.fire(new PlayerChatEvent(p_244548_1_, this.player));
++         // Velox end
+          if (p_244548_1_.startsWith("/")) {
+             this.handleCommand(p_244548_1_);
+          } else {
 diff --git a/build/mcp_diff_src/net/minecraft/profiler/Profiler.java b/src/main/java/net/minecraft/profiler/Profiler.java
 index 11d9594..b61b7fc 100644
 --- a/build/mcp_diff_src/net/minecraft/profiler/Profiler.java
@@ -1759,6 +2951,19 @@ index 11d9594..b61b7fc 100644
        this.getCurrentEntry().counters.addTo(p_230036_1_.get(), 1L);
     }
  
+diff --git a/build/mcp_diff_src/net/minecraft/resources/IResourceManagerReloadListener.java b/src/main/java/net/minecraft/resources/IResourceManagerReloadListener.java
+index 2f153b6..ba0bad6 100644
+--- a/build/mcp_diff_src/net/minecraft/resources/IResourceManagerReloadListener.java
++++ b/src/main/java/net/minecraft/resources/IResourceManagerReloadListener.java
+@@ -9,7 +9,7 @@ public interface IResourceManagerReloadListener extends IFutureReloadListener {
+    default CompletableFuture<Void> reload(IFutureReloadListener.IStage p_215226_1_, IResourceManager p_215226_2_, IProfiler p_215226_3_, IProfiler p_215226_4_, Executor p_215226_5_, Executor p_215226_6_) {
+       return p_215226_1_.wait(Unit.INSTANCE).thenRunAsync(() -> {
+          p_215226_4_.startTick();
+-         p_215226_4_.push("listener");
++         p_215226_4_.push("me/mikex86/veloxapi/event");
+          this.onResourceManagerReload(p_215226_2_);
+          p_215226_4_.pop();
+          p_215226_4_.endTick();
 diff --git a/build/mcp_diff_src/net/minecraft/server/CustomServerBossInfo.java b/src/main/java/net/minecraft/server/CustomServerBossInfo.java
 index 0cc4ce8..85ecca1 100644
 --- a/build/mcp_diff_src/net/minecraft/server/CustomServerBossInfo.java
@@ -1775,6 +2980,29 @@ index 0cc4ce8..85ecca1 100644
     private int value;
     private int max = 100;
  
+diff --git a/build/mcp_diff_src/net/minecraft/server/Main.java b/src/main/java/net/minecraft/server/Main.java
+index 27796f3..ec280aa 100644
+--- a/build/mcp_diff_src/net/minecraft/server/Main.java
++++ b/src/main/java/net/minecraft/server/Main.java
+@@ -17,6 +17,7 @@ import java.util.function.BooleanSupplier;
+ import joptsimple.OptionParser;
+ import joptsimple.OptionSet;
+ import joptsimple.OptionSpec;
++import me.mikex86.velox.veloxapiimpl.server.VeloxServer;
+ import net.minecraft.command.Commands;
+ import net.minecraft.crash.CrashReport;
+ import net.minecraft.nbt.INBT;
+@@ -154,7 +155,9 @@ public class Main {
+          saveformat$levelsave.saveDataTag(dynamicregistries$impl, iserverconfiguration);
+          IServerConfiguration iserverconfiguration1 = iserverconfiguration;
+          final DedicatedServer dedicatedserver = MinecraftServer.spin((p_240762_16_) -> {
+-            DedicatedServer dedicatedserver1 = new DedicatedServer(p_240762_16_, dynamicregistries$impl, saveformat$levelsave, resourcepacklist, datapackregistries, iserverconfiguration1, serverpropertiesprovider, DataFixesManager.getDataFixer(), minecraftsessionservice, gameprofilerepository, playerprofilecache, LoggingChunkStatusListener::new);
++            // Velox start: Use VeloxServer
++            DedicatedServer dedicatedserver1 = new VeloxServer(p_240762_16_, dynamicregistries$impl, saveformat$levelsave, resourcepacklist, datapackregistries, iserverconfiguration1, serverpropertiesprovider, DataFixesManager.getDataFixer(), minecraftsessionservice, gameprofilerepository, playerprofilecache, LoggingChunkStatusListener::new);
++            // Velox end
+             dedicatedserver1.setSingleplayerName(optionset.valueOf(optionspec8));
+             dedicatedserver1.setPort(optionset.valueOf(optionspec11));
+             dedicatedserver1.setDemo(optionset.has(optionspec2));
 diff --git a/build/mcp_diff_src/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
 index 746db22..89461e7 100644
 --- a/build/mcp_diff_src/net/minecraft/server/MinecraftServer.java
@@ -1895,6 +3123,25 @@ index 746db22..89461e7 100644
  
     public String getServerVersion() {
        return SharedConstants.getCurrentVersion().getName();
+diff --git a/build/mcp_diff_src/net/minecraft/server/dedicated/DedicatedServer.java b/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
+index e2a7184..f8b9c43 100644
+--- a/build/mcp_diff_src/net/minecraft/server/dedicated/DedicatedServer.java
++++ b/src/main/java/net/minecraft/server/dedicated/DedicatedServer.java
+@@ -172,12 +172,12 @@ public class DedicatedServer extends MinecraftServer implements IServer {
+          }
+ 
+          if (serverproperties.enableQuery) {
+-            LOGGER.info("Starting GS4 status listener");
++            LOGGER.info("Starting GS4 status veloxapi.listener");
+             this.queryThreadGs4 = QueryThread.create(this);
+          }
+ 
+          if (serverproperties.enableRcon) {
+-            LOGGER.info("Starting remote control listener");
++            LOGGER.info("Starting remote control veloxapi.listener");
+             this.rconThread = MainThread.create(this);
+          }
+ 
 diff --git a/build/mcp_diff_src/net/minecraft/util/ClassInheritanceMultiMap.java b/src/main/java/net/minecraft/util/ClassInheritanceMultiMap.java
 index 0ba4fdf..cf5f6bd 100644
 --- a/build/mcp_diff_src/net/minecraft/util/ClassInheritanceMultiMap.java
@@ -2309,10 +3556,10 @@ index de4b6ec..83cf9df 100644
     final class DistanceGraph extends SectionDistanceGraph {
        private final Long2ByteMap levels = new Long2ByteOpenHashMap();
 diff --git a/build/mcp_diff_src/net/minecraft/world/World.java b/src/main/java/net/minecraft/world/World.java
-index d5fbf20..aad1406 100644
+index d5fbf20..9b04567 100644
 --- a/build/mcp_diff_src/net/minecraft/world/World.java
 +++ b/src/main/java/net/minecraft/world/World.java
-@@ -7,10 +7,14 @@ import java.util.Collection;
+@@ -7,10 +7,15 @@ import java.util.Collection;
  import java.util.Iterator;
  import java.util.List;
  import java.util.Random;
@@ -2323,11 +3570,20 @@ index d5fbf20..aad1406 100644
  import java.util.function.Supplier;
  import javax.annotation.Nullable;
 +
-+import me.mikex86.velox.tick.region.TickRegionManager;
++import me.mikex86.velox.tick.global.WorldTickManager;
++import me.mikex86.velox.tick.region.RegionTickManager;
  import net.minecraft.block.AbstractFireBlock;
  import net.minecraft.block.Block;
  import net.minecraft.block.BlockState;
-@@ -70,10 +74,12 @@ public abstract class World implements IWorld, AutoCloseable {
+@@ -55,6 +60,7 @@ import net.minecraft.world.chunk.IChunk;
+ import net.minecraft.world.gen.Heightmap;
+ import net.minecraft.world.lighting.WorldLightManager;
+ import net.minecraft.world.server.ChunkHolder;
++import net.minecraft.world.server.ServerWorld;
+ import net.minecraft.world.storage.ISpawnWorldInfo;
+ import net.minecraft.world.storage.IWorldInfo;
+ import net.minecraft.world.storage.MapData;
+@@ -70,10 +76,12 @@ public abstract class World implements IWorld, AutoCloseable {
     public static final RegistryKey<World> NETHER = RegistryKey.create(Registry.DIMENSION_REGISTRY, new ResourceLocation("the_nether"));
     public static final RegistryKey<World> END = RegistryKey.create(Registry.DIMENSION_REGISTRY, new ResourceLocation("the_end"));
     private static final Direction[] DIRECTIONS = Direction.values();
@@ -2344,17 +3600,45 @@ index d5fbf20..aad1406 100644
     private final Thread thread;
     private final boolean isDebug;
     private int skyDarken;
-@@ -92,6 +98,9 @@ public abstract class World implements IWorld, AutoCloseable {
+@@ -92,8 +100,14 @@ public abstract class World implements IWorld, AutoCloseable {
     private final WorldBorder worldBorder;
     private final BiomeManager biomeManager;
     private final RegistryKey<World> dimension;
 +   // Velox start: TickRegionManager
-+   public final TickRegionManager tickRegionManager = new TickRegionManager();
++   public final RegionTickManager regionTickManager = new RegionTickManager(this);
 +   // Velox end
  
     protected World(ISpawnWorldInfo p_i241925_1_, RegistryKey<World> p_i241925_2_, final DimensionType p_i241925_3_, Supplier<IProfiler> p_i241925_4_, boolean p_i241925_5_, boolean p_i241925_6_, long p_i241925_7_) {
++      // Velox start: Inform Velox API of new TickRegionManager
++      WorldTickManager.addTickRegionManager(this, this.regionTickManager);
++      // Velox end
        this.profiler = p_i241925_4_;
-@@ -168,58 +177,74 @@ public abstract class World implements IWorld, AutoCloseable {
+       this.levelData = p_i241925_1_;
+       this.dimensionType = p_i241925_3_;
+@@ -118,6 +132,22 @@ public abstract class World implements IWorld, AutoCloseable {
+       this.isDebug = p_i241925_6_;
+    }
+ 
++   // Velox start: unique world id
++   private final int id;
++   private static int nextId = 0;
++
++   {
++      synchronized (ServerWorld.class) {
++         id = nextId;
++         nextId++;
++      }
++   }
++
++   public int getWorldId() {
++      return id;
++   }
++   // Velox end
++
+    public boolean isClientSide() {
+       return this.isClientSide;
+    }
+@@ -168,58 +198,74 @@ public abstract class World implements IWorld, AutoCloseable {
        }
     }
  
@@ -2427,13 +3711,6 @@ index d5fbf20..aad1406 100644
 -                     this.updateNeighbourForOutputSignal(p_241211_1_, block);
 +                  if ((p_241211_3_ & 2) != 0 && (!this.isClientSide || (p_241211_3_ & 4) == 0) && (this.isClientSide || chunk.getFullStatus() != null && chunk.getFullStatus().isOrAfter(ChunkHolder.LocationType.TICKING))) {
 +                     this.sendBlockUpdated(p_241211_1_, blockstate, p_241211_2_, p_241211_3_);
-+                  }
-+
-+                  if ((p_241211_3_ & 1) != 0) {
-+                     this.blockUpdated(p_241211_1_, blockstate.getBlock());
-+                     if (!this.isClientSide && p_241211_2_.hasAnalogOutputSignal()) {
-+                        this.updateNeighbourForOutputSignal(p_241211_1_, block);
-+                     }
                    }
 -               }
  
@@ -2442,6 +3719,13 @@ index d5fbf20..aad1406 100644
 -                  blockstate.updateIndirectNeighbourShapes(this, p_241211_1_, i, p_241211_4_ - 1);
 -                  p_241211_2_.updateNeighbourShapes(this, p_241211_1_, i, p_241211_4_ - 1);
 -                  p_241211_2_.updateIndirectNeighbourShapes(this, p_241211_1_, i, p_241211_4_ - 1);
++                  if ((p_241211_3_ & 1) != 0) {
++                     this.blockUpdated(p_241211_1_, blockstate.getBlock());
++                     if (!this.isClientSide && p_241211_2_.hasAnalogOutputSignal()) {
++                        this.updateNeighbourForOutputSignal(p_241211_1_, block);
++                     }
++                  }
++
 +                  if ((p_241211_3_ & 16) == 0 && p_241211_4_ > 0) {
 +                     int i = p_241211_3_ & -34;
 +                     blockstate.updateIndirectNeighbourShapes(this, p_241211_1_, i, p_241211_4_ - 1);
@@ -2465,7 +3749,7 @@ index d5fbf20..aad1406 100644
     }
  
     public void onBlockStateChange(BlockPos p_217393_1_, BlockState p_217393_2_, BlockState p_217393_3_) {
-@@ -527,9 +552,9 @@ public abstract class World implements IWorld, AutoCloseable {
+@@ -527,9 +573,9 @@ public abstract class World implements IWorld, AutoCloseable {
     public TileEntity getBlockEntity(BlockPos p_175625_1_) {
        if (isOutsideBuildHeight(p_175625_1_)) {
           return null;
@@ -2478,7 +3762,7 @@ index d5fbf20..aad1406 100644
           if (this.updatingBlockEntities) {
              tileentity = this.getPendingBlockEntityAt(p_175625_1_);
 diff --git a/build/mcp_diff_src/net/minecraft/world/chunk/Chunk.java b/src/main/java/net/minecraft/world/chunk/Chunk.java
-index 551fa3d..df80403 100644
+index 551fa3d..ae322f4 100644
 --- a/build/mcp_diff_src/net/minecraft/world/chunk/Chunk.java
 +++ b/src/main/java/net/minecraft/world/chunk/Chunk.java
 @@ -65,11 +65,15 @@ public class Chunk implements IChunk {
@@ -2504,7 +3788,7 @@ index 551fa3d..df80403 100644
  
     public void setLoaded(boolean p_177417_1_) {
 +      // Velox start: inform tick region manager of chunk load state change
-+      this.level.tickRegionManager.informChunkLoadStateChange(this, p_177417_1_);
++      this.level.regionTickManager.informChunkLoadStateChange(this, p_177417_1_);
 +      // Velox end
        this.loaded = p_177417_1_;
     }
@@ -3245,7 +4529,7 @@ index a78bb2e..43e65d5 100644
     }
  }
 diff --git a/build/mcp_diff_src/net/minecraft/world/server/ServerWorld.java b/src/main/java/net/minecraft/world/server/ServerWorld.java
-index 7120174..93eda29 100644
+index 7120174..c46d616 100644
 --- a/build/mcp_diff_src/net/minecraft/world/server/ServerWorld.java
 +++ b/src/main/java/net/minecraft/world/server/ServerWorld.java
 @@ -9,11 +9,11 @@ import com.google.common.collect.Sets;
@@ -3263,17 +4547,18 @@ index 7120174..93eda29 100644
  import java.io.IOException;
  import java.io.Writer;
  import java.nio.file.Files;
-@@ -35,6 +35,9 @@ import java.util.stream.Collectors;
+@@ -35,6 +35,10 @@ import java.util.stream.Collectors;
  import java.util.stream.Stream;
  import javax.annotation.Nonnull;
  import javax.annotation.Nullable;
 +
 +import me.mikex86.velox.tick.debug.MadMaxTickManager;
++import me.mikex86.velox.tick.global.WorldTickManager;
 +import me.mikex86.velox.tick.ticklist.block.ConcurrentTickList;
  import net.minecraft.block.Block;
  import net.minecraft.block.BlockEventData;
  import net.minecraft.block.BlockState;
-@@ -146,10 +149,18 @@ import org.apache.logging.log4j.Logger;
+@@ -146,10 +150,18 @@ import org.apache.logging.log4j.Logger;
  public class ServerWorld extends World implements ISeedReader {
     public static final BlockPos END_SPAWN_POINT = new BlockPos(100, 50, 0);
     private static final Logger LOGGER = LogManager.getLogger();
@@ -3296,7 +4581,7 @@ index 7120174..93eda29 100644
     private final ServerChunkProvider chunkSource;
     boolean tickingEntities;
     private final MinecraftServer server;
-@@ -158,15 +169,23 @@ public class ServerWorld extends World implements ISeedReader {
+@@ -158,15 +170,23 @@ public class ServerWorld extends World implements ISeedReader {
     private boolean allPlayersSleeping;
     private int emptyTime;
     private final Teleporter portalForcer;
@@ -3324,7 +4609,7 @@ index 7120174..93eda29 100644
     private boolean handlingTick;
     private final List<ISpecialSpawner> customSpawners;
     @Nullable
-@@ -180,9 +199,11 @@ public class ServerWorld extends World implements ISeedReader {
+@@ -180,9 +200,11 @@ public class ServerWorld extends World implements ISeedReader {
        this.server = p_i241885_1_;
        this.customSpawners = p_i241885_12_;
        this.serverLevelData = p_i241885_4_;
@@ -3336,7 +4621,7 @@ index 7120174..93eda29 100644
        this.portalForcer = new Teleporter(this);
        this.updateSkyBrightness();
        this.prepareWeather();
-@@ -344,75 +365,113 @@ public class ServerWorld extends World implements ISeedReader {
+@@ -344,75 +366,120 @@ public class ServerWorld extends World implements ISeedReader {
        }
  
        if (flag3 || this.emptyTime++ < 300) {
@@ -3442,19 +4727,26 @@ index 7120174..93eda29 100644
              }
 +         });
 +      }
-+      // tick entities
+ 
+-            iprofiler.pop();
 +      {
 +         if (MadMaxTickManager.MAD_MAX_MODE) {
++            // tick entities
++            // TODO: MAD MAX MODE PLUGIN TASK SUPPORT?
 +            MadMaxTickManager.tickMadMax(this.entitiesById.values(), this::tickEntity);
 +         } else {
 +            // build tick list. Predicate: entity.getVehicle() is null.
 +            // Passengers are ticked after main entity tick in #tickNonPassenger.
 +            // Avoid double ticking passengers.
-+            this.tickRegionManager.buildEntityTickList(this.entitiesById.values().iterator(), entity -> entity.getVehicle() == null);
- 
--            iprofiler.pop();
++            this.regionTickManager.buildEntityTickList(this.entitiesById.values().iterator(), entity -> entity.getVehicle() == null);
++
++            // Run Global world tick tasks.
++            // The region tick list is built when they run, but no state mutation to the world is happening. Important!
++            // The entity tick list is used to determine which entities are in which region.
++            WorldTickManager.runTasks(this);
++
 +            // tick entities
-+            this.tickRegionManager.applyEntityTask(this::tickEntity);
++            this.regionTickManager.applyEntityTask(this::tickEntity);
 +         }
 +      }
 +      // remove all entities marked for removal from the entity lists (server global, chunk local, invoke listeners etc...)
@@ -3500,7 +4792,7 @@ index 7120174..93eda29 100644
  
     protected void tickTime() {
        if (this.tickTime) {
-@@ -1019,7 +1078,9 @@ public class ServerWorld extends World implements ISeedReader {
+@@ -1019,7 +1086,9 @@ public class ServerWorld extends World implements ISeedReader {
  
     private void runBlockEvents() {
        while(!this.blockEvents.isEmpty()) {
@@ -3511,7 +4803,7 @@ index 7120174..93eda29 100644
           if (this.doBlockEvent(blockeventdata)) {
              this.server.getPlayerList().broadcast((PlayerEntity)null, (double)blockeventdata.getPos().getX(), (double)blockeventdata.getPos().getY(), (double)blockeventdata.getPos().getZ(), 64.0D, this.dimension(), new SBlockActionPacket(blockeventdata.getPos(), blockeventdata.getBlock(), blockeventdata.getParamA(), blockeventdata.getParamB()));
           }
-@@ -1410,4 +1471,16 @@ public class ServerWorld extends World implements ISeedReader {
+@@ -1410,4 +1479,16 @@ public class ServerWorld extends World implements ISeedReader {
           p_241121_0_.setBlockAndUpdate(p_241122_1_, Blocks.OBSIDIAN.defaultBlockState());
        });
     }

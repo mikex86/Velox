@@ -19,7 +19,7 @@ configurations {
 }
 
 group = 'me.mikex86'
-version = '1.0.2-alpha'
+version = '1.0.3-alpha'
 
 ext {
     minecraft_version = '1.16.5'
@@ -34,6 +34,7 @@ repositories {
 
 dependencies {
     shade 'net.minecraftforge:forgespi:3.0.+'
+    shade 'org.jetbrains:annotations:20.1.0'
 }
 
 project(':mcp') {
@@ -100,7 +101,10 @@ task runclient(type: JavaExec) {
 task createDiffs() {
     doFirst {
         mkdir 'diffs'
-        def process = Runtime.getRuntime().exec("git diff --no-index build/mcp_diff_src/ src/main/java/ --output diffs/velox_source.diff")
+        def process = new ProcessBuilder("git diff --no-index build/mcp_diff_src/ src/main/java/ --output diffs/velox_source.diff".split(" "))
+                .inheritIO()
+                .directory(projectDir)
+                .start()
         process.waitFor()
     }
 }
@@ -113,7 +117,10 @@ task applyDiffs() {
         }
         def diffs = file("diffs").listFiles()
         diffs.each { diff ->
-            def process = Runtime.getRuntime().exec("git apply \"${diff.path}\"")
+            def process = new ProcessBuilder("git apply \"${diff.path}\"")
+                    .inheritIO()
+                    .directory(projectDir)
+                    .start()
             process.waitFor()
         }
         delete 'build/mcp_diff_src'
