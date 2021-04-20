@@ -7,7 +7,7 @@
 Velox primary goal is to improve performance of the Vanilla server.
 Minor behaviour changes are not specifically aimed to be avoided.
 Compatibility with the Bukkit API is intentionally dropped to avoid running
-into limitations introduced by an API that was designed around the singled threaded architecture
+into limitations introduced by an API that was designed around the single threaded architecture
 of Minecraft.
 
 
