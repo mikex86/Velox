@@ -68,25 +68,17 @@ index 0000000..239ec96
 +}
 diff --git a/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java b/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java
 new file mode 100644
-index 0000000..a4cc59b
+index 0000000..78fdffc
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/chunk/ConcurrentChunkProvider.java
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,45 @@
 +package me.mikex86.velox.chunk;
 +
 +import java.util.concurrent.Executor;
-+import java.util.concurrent.TimeUnit;
 +import java.util.function.Supplier;
 +
-+import com.google.common.cache.CacheBuilder;
 +import me.mikex86.velox.chunk.cache.IChunkCache;
-+import me.mikex86.velox.chunk.cache.TwoTierChunkCache;
-+import me.mikex86.velox.utils.ArrayUtils;
-+import me.mikex86.velox.utils.PeriodicInvoker;
-+import me.mikex86.velox.utils.cache.LossyLongChunkCache;
-+import me.mikex86.velox.utils.cache.guava.AccessCountingCache;
-+import net.minecraft.util.math.ChunkPos;
-+import net.minecraft.world.chunk.Chunk;
++import me.mikex86.velox.chunk.cache.ChunkCache;
 +import net.minecraft.world.server.ServerChunkProvider;
 +import net.minecraft.world.server.ServerWorld;
 +
@@ -100,10 +92,13 @@ index 0000000..a4cc59b
 +import net.minecraft.world.storage.DimensionSavedDataManager;
 +
 +import net.minecraft.world.storage.SaveFormat.LevelSave;
++import org.jetbrains.annotations.NotNull;
++import org.jetbrains.annotations.Nullable;
 +
 +public class ConcurrentChunkProvider extends ServerChunkProvider {
 +
-+    private final IChunkCache chunkCache = new TwoTierChunkCache();
++    @NotNull
++    private final IChunkCache chunkCache = new ChunkCache(key -> super.fallbackLookup(key.getChunkX(), key.getChunkZ(), key.getStatusIndex(), key.shouldLoad()));
 +
 +    public ConcurrentChunkProvider(ServerWorld worldIn, LevelSave worldDirectory, DataFixer dataFixer,
 +                                   TemplateManager templateManagerIn, Executor executorIn, ChunkGenerator chunkGeneratorIn, int viewDistance,
@@ -116,162 +111,450 @@ index 0000000..a4cc59b
 +        // Invoked after every tick. Do nothing here...
 +    }
 +
++    @Nullable
 +    @Override
-+    protected IChunk lookupChunkCache(long packedChunkPos, ChunkStatus requiredStatus, boolean load) {
-+        return this.chunkCache.lookupChunkCache(packedChunkPos, requiredStatus, load);
++    protected IChunk getChunk(long packedChunkPos, @NotNull ChunkStatus requiredStatus, boolean load) {
++        return this.chunkCache.getChunk(packedChunkPos, requiredStatus, load);
++    }
++}
+diff --git a/src/main/java/me/mikex86/velox/chunk/cache/ChunkCache.java b/src/main/java/me/mikex86/velox/chunk/cache/ChunkCache.java
+new file mode 100644
+index 0000000..56f4f8d
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/chunk/cache/ChunkCache.java
+@@ -0,0 +1,88 @@
++package me.mikex86.velox.chunk.cache;
++
++import com.github.benmanes.caffeine.cache.Caffeine;
++import com.github.benmanes.caffeine.cache.LoadingCache;
++import net.minecraft.util.math.ChunkPos;
++import net.minecraft.world.chunk.ChunkStatus;
++import net.minecraft.world.chunk.IChunk;
++import org.jetbrains.annotations.NotNull;
++import org.jetbrains.annotations.Nullable;
++
++import java.util.concurrent.TimeUnit;
++import java.util.function.Function;
++
++public class ChunkCache implements IChunkCache {
++
++    @NotNull
++    private final LoadingCache<ChunkLookupKey, IChunk> cache;
++
++    public ChunkCache(@NotNull Function<@NotNull ChunkLookupKey, IChunk> cacheBuildFunction) {
++        // TODO: MAKE CONFIGURABLE
++        this.cache = Caffeine.newBuilder()
++                .maximumSize(10_000)
++                .expireAfterWrite(5, TimeUnit.MINUTES)
++                .build(cacheBuildFunction::apply);
 +    }
 +
 +    @Override
-+    protected void populateChunkCache(int chunkX, int chunkZ, IChunk chunk, ChunkStatus requiredStatus, boolean load) {
-+        this.chunkCache.populateChunkCache(chunkX, chunkZ, chunk, requiredStatus, load);
++    @Nullable
++    public IChunk getChunk(long packedChunkPos, ChunkStatus requiredStatus, boolean load) {
++        return this.cache.get(new ChunkLookupKey(packedChunkPos, requiredStatus, load));
++    }
++
++    public static class ChunkLookupKey {
++
++        private final long key;
++        private final int chunkX, chunkZ;
++        private final ChunkStatus statusIndex;
++        private final boolean load;
++
++        public ChunkLookupKey(long key, ChunkStatus statusIndex, boolean load) {
++            this.key = key;
++            this.chunkX = ChunkPos.getX(key);
++            this.chunkZ = ChunkPos.getZ(key);
++            this.statusIndex = statusIndex;
++            this.load = load;
++        }
++
++        public int getChunkX() {
++            return chunkX;
++        }
++
++        public int getChunkZ() {
++            return chunkZ;
++        }
++
++        public ChunkStatus getStatusIndex() {
++            return statusIndex;
++        }
++
++        public boolean shouldLoad() {
++            return load;
++        }
++
++        public static ChunkLookupKey of(int chunkX, int chunkZ, ChunkStatus requiredChunkStatus, boolean load) {
++            return new ChunkLookupKey(ChunkPos.asLong(chunkX, chunkZ), requiredChunkStatus, load);
++        }
++
++        @Override
++        public boolean equals(Object o) {
++            if (this == o) return true;
++            if (o == null || getClass() != o.getClass()) return false;
++
++            ChunkLookupKey that = (ChunkLookupKey) o;
++
++            if (key != that.key) return false;
++            if (statusIndex != that.statusIndex) return false;
++            return load == that.load;
++        }
++
++        @Override
++        public int hashCode() {
++            int result = (int) (key ^ (key >>> 32));
++            result = 31 * result + statusIndex.getIndex();
++            result = 31 * result + (load ? 1 : 0);
++            return result;
++        }
 +    }
 +}
 diff --git a/src/main/java/me/mikex86/velox/chunk/cache/IChunkCache.java b/src/main/java/me/mikex86/velox/chunk/cache/IChunkCache.java
 new file mode 100644
-index 0000000..a3aa48b
+index 0000000..f5571ec
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/chunk/cache/IChunkCache.java
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,13 @@
 +package me.mikex86.velox.chunk.cache;
 +
 +import net.minecraft.world.chunk.ChunkStatus;
 +import net.minecraft.world.chunk.IChunk;
++import org.jetbrains.annotations.Nullable;
 +
 +public interface IChunkCache {
 +
-+    IChunk lookupChunkCache(long packedChunkPos, ChunkStatus requiredStatus, boolean load);
-+
-+    void populateChunkCache(int chunkX, int chunkZ, IChunk chunk, ChunkStatus requiredStatus, boolean load);
-+
-+    class ChunkCacheEntry {
-+
-+        private final IChunk chunk;
-+        private final ChunkStatus cachedChunkStatus;
-+        private final boolean loaded;
-+
-+        public ChunkCacheEntry(IChunk chunk, ChunkStatus cachedChunkStatus, boolean loaded) {
-+            this.chunk = chunk;
-+            this.cachedChunkStatus = cachedChunkStatus;
-+            this.loaded = loaded;
-+        }
-+
-+        public boolean isLoaded() {
-+            return loaded;
-+        }
-+
-+        public IChunk getChunk() {
-+            return chunk;
-+        }
-+
-+        public ChunkStatus getCachedChunkStatus() {
-+            return cachedChunkStatus;
-+        }
-+    }
++    @Nullable
++    IChunk getChunk(long packedChunkPos, ChunkStatus requiredStatus, boolean load);
 +
 +
 +}
-diff --git a/src/main/java/me/mikex86/velox/chunk/cache/TwoTierChunkCache.java b/src/main/java/me/mikex86/velox/chunk/cache/TwoTierChunkCache.java
+diff --git a/src/main/java/me/mikex86/velox/optimizedtnt/ExplosionDistanceMap.java b/src/main/java/me/mikex86/velox/optimizedtnt/ExplosionDistanceMap.java
 new file mode 100644
-index 0000000..a482916
+index 0000000..b73469b
 --- /dev/null
-+++ b/src/main/java/me/mikex86/velox/chunk/cache/TwoTierChunkCache.java
-@@ -0,0 +1,98 @@
-+package me.mikex86.velox.chunk.cache;
++++ b/src/main/java/me/mikex86/velox/optimizedtnt/ExplosionDistanceMap.java
+@@ -0,0 +1,52 @@
++package me.mikex86.velox.optimizedtnt;
 +
-+import com.google.common.cache.CacheBuilder;
-+import me.mikex86.velox.utils.ArrayUtils;
-+import me.mikex86.velox.utils.PeriodicInvoker;
-+import me.mikex86.velox.utils.cache.LossyLongChunkCache;
-+import me.mikex86.velox.utils.cache.guava.AccessCountingCache;
-+import net.minecraft.util.math.ChunkPos;
-+import net.minecraft.world.chunk.ChunkStatus;
-+import net.minecraft.world.chunk.IChunk;
++import me.mikex86.velox.utils.MathUtils;
 +
-+import java.util.concurrent.TimeUnit;
++import java.util.Arrays;
 +
-+public class TwoTierChunkCache implements IChunkCache {
++public class ExplosionDistanceMap {
 +
-+    // TODO: MAKE CACHES CONFIGURABLE
++    private static final int distanceMapResolution = 8;
++    private static final int distanceMapResolutionSquared = distanceMapResolution * distanceMapResolution;
++    private static final int distanceMapLength = distanceMapResolution * distanceMapResolution * distanceMapResolution;
++    private static final double[] preBakedDistanceMap = new double[distanceMapLength];
 +
-+    /**
-+     * A fast, lossy, l1 cache.
-+     * Index collisions are fairly likely to occur, in which case we just miss.
-+     * Point is, this cache misses all the time.
-+     * Hash collisions are also not handled.
-+     * Good that the packed chunk pos long format does not produce these collisions.
-+     */
-+    private final LossyLongChunkCache l1Cache = new LossyLongChunkCache(256);
-+
-+    /**
-+     * A bigger, slower (~ 10 times slower than L1), more sophisticated cache.
-+     * (Still better than fallback, ~10 times slower than L2)
-+     */
-+    private final AccessCountingCache<Long, IChunkCache.ChunkCacheEntry> l2Cache = AccessCountingCache.wrap(CacheBuilder.newBuilder()
-+            .maximumSize(2048)
-+            .expireAfterAccess(3, TimeUnit.MINUTES)
-+            .build());
-+
-+    public TwoTierChunkCache() {
-+        Thread cacheCleaner = new Thread(new PeriodicInvoker(this.l2Cache::cleanUp, 1000, TimeUnit.MILLISECONDS), "ChunkCacheCleaner");
-+        cacheCleaner.setDaemon(true);
-+        cacheCleaner.start();
++    static {
++        initializeDistanceMap();
 +    }
 +
-+    @Override
-+    public IChunk lookupChunkCache(long packedChunkPos, ChunkStatus requiredStatus, boolean load) {
-+        IChunkCache.ChunkCacheEntry cacheEntry;
-+        // Query L1 cache
-+        {
-+            cacheEntry = this.l1Cache.get(packedChunkPos);
++    private static void initializeDistanceMap() {
++        Arrays.fill(preBakedDistanceMap, 0.0); // Clear distance map
++
++        // Populate distance map with unit distance [0, 1) values
++        for (int x = 0; x < distanceMapResolution; x++) {
++            for (int y = 0; y < distanceMapResolution; y++) {
++                for (int z = 0; z < distanceMapResolution; z++) {
++                    double xUnitOffset = x / (double) distanceMapResolution;
++                    double yUnitOffset = y / (double) distanceMapResolution;
++                    double zUnitOffset = z / (double) distanceMapResolution;
++                    double unitDistance = Math.sqrt((xUnitOffset * xUnitOffset) + (yUnitOffset * yUnitOffset) + (zUnitOffset * zUnitOffset));
++                    int index = distanceMapIndex(x, y, z);
++                    preBakedDistanceMap[index] = unitDistance;
++                }
++            }
 +        }
++    }
 +
-+        if (cacheEntry == null) {
-+            cacheEntry = this.l2Cache.getIfPresent(packedChunkPos);
++    public static double getDistance(int x, int y, int z) {
++        x = MathUtils.clamp(x, 0, distanceMapResolution - 1);
++        y = MathUtils.clamp(y, 0, distanceMapResolution - 1);
++        z = MathUtils.clamp(z, 0, distanceMapResolution - 1);
++        int index = distanceMapIndex(x, y, z);
++        return preBakedDistanceMap[index];
++    }
++
++    public static int getDistanceMapResolution() {
++        return distanceMapResolution;
++    }
++
++    private static int distanceMapIndex(int x, int y, int z) {
++        return x + y * distanceMapResolution + z * distanceMapResolutionSquared;
++    }
++
++}
+diff --git a/src/main/java/me/mikex86/velox/optimizedtnt/OptimizedExplosion.java b/src/main/java/me/mikex86/velox/optimizedtnt/OptimizedExplosion.java
+new file mode 100644
+index 0000000..4186891
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/optimizedtnt/OptimizedExplosion.java
+@@ -0,0 +1,100 @@
++package me.mikex86.velox.optimizedtnt;
++
++import com.google.common.collect.Sets;
++import net.minecraft.block.Block;
++import net.minecraft.block.BlockState;
++import net.minecraft.block.Blocks;
++import net.minecraft.block.TNTBlock;
++import net.minecraft.entity.item.TNTEntity;
++import net.minecraft.fluid.FluidState;
++import net.minecraft.util.math.BlockPos;
++import net.minecraft.world.World;
++
++import java.util.Set;
++
++public class OptimizedExplosion {
++
++    public static Set<BlockPos> getExplodedBlockPositions(World world, double x, double y, double z, float radius) {
++        Set<BlockPos> explodedBlockPositions = Sets.newHashSet();
++
++        int distanceMapRes = ExplosionDistanceMap.getDistanceMapResolution();
++        for (int xo = 0; xo < distanceMapRes; xo++) {
++            for (int yo = 0; yo < distanceMapRes; yo++) {
++                for (int zo = 0; zo < distanceMapRes; zo++) {
++                    double unitDistance = ExplosionDistanceMap.getDistance(xo, yo, zo);
++                    if (unitDistance < 1) {
++                        double randomScale = (0.8 + world.random.nextDouble() * 0.2);
++                        double radiusScaledXOffset = (xo / (double) distanceMapRes) * radius * randomScale;
++                        double radiusScaledYOffset = (yo / (double) distanceMapRes) * radius * randomScale;
++                        double radiusScaledZOffset = (zo / (double) distanceMapRes) * radius * randomScale;
++                        BlockPos pos;
++
++                        // Repeat the explosion in all octants
++
++                        // y up
++                        pos = new BlockPos(x + radiusScaledXOffset, y + radiusScaledYOffset, z + radiusScaledZOffset);
++                        explodedBlockPositions.add(pos);
++
++                        pos = new BlockPos(x + radiusScaledXOffset, y + radiusScaledYOffset, z - radiusScaledZOffset);
++                        explodedBlockPositions.add(pos);
++
++                        pos = new BlockPos(x - radiusScaledXOffset, y + radiusScaledYOffset, z + radiusScaledZOffset);
++                        explodedBlockPositions.add(pos);
++
++                        pos = new BlockPos(x - radiusScaledXOffset, y + radiusScaledYOffset, z - radiusScaledZOffset);
++                        explodedBlockPositions.add(pos);
++
++                        // y down
++                        pos = new BlockPos(x + radiusScaledXOffset, y - radiusScaledYOffset, z + radiusScaledZOffset);
++                        explodedBlockPositions.add(pos);
++
++                        pos = new BlockPos(x + radiusScaledXOffset, y - radiusScaledYOffset, z - radiusScaledZOffset);
++                        explodedBlockPositions.add(pos);
++
++                        pos = new BlockPos(x - radiusScaledXOffset, y - radiusScaledYOffset, z + radiusScaledZOffset);
++                        explodedBlockPositions.add(pos);
++
++                        pos = new BlockPos(x - radiusScaledXOffset, y - radiusScaledYOffset, z - radiusScaledZOffset);
++                        explodedBlockPositions.add(pos);
++                    }
++                }
++            }
 +        }
++        return explodedBlockPositions;
++    }
 +
-+        if (cacheEntry == null) {
-+            return null; // All caches have missed
-+        }
-+
-+        IChunk chunk = cacheEntry.getChunk();
-+        ChunkStatus entryStatus = cacheEntry.getCachedChunkStatus();
-+        boolean entryLoaded = cacheEntry.isLoaded();
-+
-+        if (entryStatus != requiredStatus || entryLoaded != load) {
-+            this.cacheEvict(packedChunkPos, chunk); // Cache evict chunk for position when requiredStatus or load state is mismatched
-+            return null;
-+        }
-+
-+        return chunk;
++    private static float getBlockExplosionResistance(BlockState blockstate, FluidState fluidstate) {
++        if (blockstate.isAir() && fluidstate.isEmpty())
++            return -1;
++        return Math.max(blockstate.getBlock().getExplosionResistance(), fluidstate.getExplosionResistance());
 +    }
 +
 +
-+    private void cacheEvict(long key, IChunk chunk) {
-+        this.l1Cache.invalidate(key, chunk);
-+        this.l2Cache.invalidate(key);
++    public static void explode(World world, Set<BlockPos> toExplode) {
++        for (BlockPos pos : toExplode) {
++            explodeBlock(world, pos);
++        }
 +    }
 +
-+    private int populateCacheCalls = 0;
-+
-+    @Override
-+    public void populateChunkCache(int chunkX, int chunkZ, IChunk chunk, ChunkStatus requiredChunkStatus, boolean load) {
-+        long key = ChunkPos.asLong(chunkX, chunkZ);
-+
-+        // Populate L2 cache
-+        this.l2Cache.put(key, new ChunkCacheEntry(chunk, requiredChunkStatus, load));
-+
-+        // Populate L1 cache with the most popular values of L2
-+        // every 16 cache population calls
-+        // Fuck thread-safety for this counter...
-+        // "Oh no it was 17 times instead of 16 the world will burn"
-+        if (this.populateCacheCalls++ % 16 == 0) {
-+            int capacity = this.l1Cache.getCapacity();
-+            Long[] keysBoxed = new Long[capacity];
-+            IChunkCache.ChunkCacheEntry[] values = new IChunkCache.ChunkCacheEntry[capacity];
-+            this.l2Cache.retrieveMostAccessedValues(keysBoxed, values);
-+            long[] keys = ArrayUtils.unbox(keysBoxed);
-+            this.l1Cache.populate(keys, values);
++    private static void explodeBlock(World world, BlockPos blockPos) {
++        BlockState blockstate = world.getBlockState(blockPos);
++        Block block = blockstate.getBlock();
++        if (!blockstate.isAir()) {
++            world.setBlock(blockPos, Blocks.AIR.defaultBlockState(), 3);
++            onBlockExplosion(block, world, blockPos);
 +        }
++    }
++
++    private static void onBlockExplosion(Block block, World world, BlockPos blockPos) {
++        if (block instanceof TNTBlock) {
++            // a tnt entity when exploding away a tnt entity
++            TNTEntity tntentity = new TNTEntity(world, (double) blockPos.getX() + 0.5D, (double) blockPos.getY(), (double) blockPos.getZ() + 0.5D, null);
++            tntentity.setFuse((short) (world.random.nextInt(tntentity.getLife() / 4) + tntentity.getLife() / 8));
++            world.addFreshEntity(tntentity);
++        } else {
++            // other block implementations do not use the explosion parameter, therefore we can leave it null.
++            // UPDATE_CAUTION: Check if new blocks access the explosion parameter in Block#wasExploded
++            block.wasExploded(world, blockPos, null);
++        }
++    }
++}
+diff --git a/src/main/java/me/mikex86/velox/optimizedtnt/OptimizedTnt.java b/src/main/java/me/mikex86/velox/optimizedtnt/OptimizedTnt.java
+new file mode 100644
+index 0000000..fe33bad
+--- /dev/null
++++ b/src/main/java/me/mikex86/velox/optimizedtnt/OptimizedTnt.java
+@@ -0,0 +1,157 @@
++package me.mikex86.velox.optimizedtnt;
++
++import com.google.common.collect.Lists;
++import com.google.common.collect.Maps;
++import com.google.common.collect.Sets;
++import me.mikex86.velox.utils.Streamer;
++import me.mikex86.velox.utils.threading.ThreadingUtil;
++import net.minecraft.enchantment.ProtectionEnchantment;
++import net.minecraft.entity.Entity;
++import net.minecraft.entity.LivingEntity;
++import net.minecraft.entity.item.TNTEntity;
++import net.minecraft.entity.player.PlayerEntity;
++import net.minecraft.entity.player.ServerPlayerEntity;
++import net.minecraft.network.play.server.SExplosionPacket;
++import net.minecraft.util.math.AxisAlignedBB;
++import net.minecraft.util.math.BlockPos;
++import net.minecraft.util.math.MathHelper;
++import net.minecraft.util.math.vector.Vector3d;
++import net.minecraft.world.Explosion;
++import net.minecraft.world.World;
++import net.minecraft.world.server.ServerWorld;
++import org.jetbrains.annotations.NotNull;
++
++import java.util.*;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.ExecutorService;
++import java.util.stream.Collectors;
++
++public class OptimizedTnt {
++
++    // TODO: MAKE CONFIGURABLE
++    private static final int nThreads = Runtime.getRuntime().availableProcessors();
++
++    @NotNull
++    private static final ExecutorService service = ThreadingUtil.newWorkerPool("TntPool", nThreads, null);
++
++    public static void performExplosions(Collection<Entity> allEntities) {
++
++        // Compute all TNT entities to tick
++        Collection<TNTEntity> tntEntities = allEntities.parallelStream().filter(e -> e instanceof TNTEntity).map(e -> (TNTEntity) e).collect(Collectors.toList());
++
++        try {
++            // Tick TNT entities. (Performs movement + sets TNTEntity#exploded)
++            Streamer.streamBatched(service, nThreads, tntEntities, TNTEntity::tick);
++        } catch (InterruptedException | ExecutionException e) {
++            e.printStackTrace();
++        }
++
++        // Compute all TNT entities that exploded during this tick
++        Collection<TNTEntity> exploded = tntEntities.parallelStream().filter(e -> e.exploded).collect(Collectors.toList());
++
++        // Compute block positions to explode in their respective worlds
++        Map<World, Set<BlockPos>> explodedBlockWorldMap = Collections.synchronizedMap(Maps.newHashMap());
++        try {
++            Streamer.streamBatched(service, nThreads, exploded,
++                    tntEntity -> {
++                        World world = tntEntity.level;
++                        Set<BlockPos> toExplode = explodedBlockWorldMap.get(world);
++                        if (toExplode == null) {
++                            toExplode = Sets.newConcurrentHashSet();
++                            explodedBlockWorldMap.put(world, toExplode);
++                        }
++                        toExplode.addAll(getTNTExplodedBlockPositions(tntEntity));
++                    }
++            );
++        } catch (InterruptedException | ExecutionException e) {
++            e.printStackTrace();
++        }
++
++        // Damage entities
++        Map<PlayerEntity, Vector3d> hitPlayers = performTntEntityDamage(exploded);
++
++        // Send explosion packets
++        if (!exploded.isEmpty()) {
++            for (TNTEntity tntEntity : exploded) {
++                List<ServerPlayerEntity> nearbyPlayers = ((ServerWorld) tntEntity.level).getPlayers(player -> player.distanceToSqr(tntEntity) < 4096);
++                for (ServerPlayerEntity nearbyPlayer : nearbyPlayers) {
++                    // send an empty block list because the blocks are updated via a multi block change packet anyways... WTF MOJANG?
++                    nearbyPlayer.connection.send(new SExplosionPacket(tntEntity.getX(), tntEntity.getY(), tntEntity.getZ(), 4F, Lists.newArrayList(), hitPlayers.get(nearbyPlayer)));
++                }
++            }
++        }
++
++        // Break blocks to explode, spawns tnt entities when exploding a tnt block, tntEntities is now outdated
++        for (Map.Entry<World, Set<BlockPos>> worldSetEntry : explodedBlockWorldMap.entrySet()) {
++            ServerWorld world = (ServerWorld) worldSetEntry.getKey();
++            Set<BlockPos> toExplode = worldSetEntry.getValue();
++            OptimizedExplosion.explode(world, toExplode);
++        }
++    }
++
++    private static Map<PlayerEntity, Vector3d> performTntEntityDamage(Collection<TNTEntity> exploded) {
++        Map<PlayerEntity, Vector3d> hitPlayers = Maps.newConcurrentMap();
++        for (TNTEntity tntEntity : exploded) {
++            try {
++                Streamer.streamBatched(service, nThreads, exploded, entity -> hitPlayers.putAll(performTntEntityDamage(tntEntity)));
++            } catch (InterruptedException | ExecutionException e) {
++                e.printStackTrace();
++            }
++        }
++        return hitPlayers;
++    }
++
++    private static Map<PlayerEntity, Vector3d> performTntEntityDamage(TNTEntity tntEntity) {
++        Map<PlayerEntity, Vector3d> hitPlayers = Maps.newHashMap();
++        float radius = 4.0F;
++        float f2 = radius * 2.0F;
++        int k1 = MathHelper.floor(tntEntity.getX() - (double) f2 - 1.0D);
++        int l1 = MathHelper.floor(tntEntity.getX() + (double) f2 + 1.0D);
++        int i2 = MathHelper.floor(tntEntity.getY() - (double) f2 - 1.0D);
++        int i1 = MathHelper.floor(tntEntity.getY() + (double) f2 + 1.0D);
++        int j2 = MathHelper.floor(tntEntity.getZ() - (double) f2 - 1.0D);
++        int j1 = MathHelper.floor(tntEntity.getZ() + (double) f2 + 1.0D);
++
++        List<Entity> entities = tntEntity.level.getEntities(tntEntity, new AxisAlignedBB(k1, i2, j2, l1, i1, j1));
++        Vector3d vector3d = new Vector3d(tntEntity.getX(), tntEntity.getY(), tntEntity.getZ());
++
++        for (int k2 = 0; k2 < entities.size(); ++k2) {
++            Entity entity = entities.get(k2);
++            if (!entity.ignoreExplosion()) {
++                double d12 = (double) (MathHelper.sqrt(entity.distanceToSqr(vector3d)) / f2);
++                if (d12 <= 1.0D) {
++                    double d5 = entity.getX() - tntEntity.getX();
++                    double d7 = (entity instanceof TNTEntity ? entity.getY() : entity.getEyeY()) - tntEntity.getY();
++                    double d9 = entity.getZ() - tntEntity.getZ();
++                    double d13 = (double) MathHelper.sqrt(d5 * d5 + d7 * d7 + d9 * d9);
++                    if (d13 != 0.0D) {
++                        d5 = d5 / d13;
++                        d7 = d7 / d13;
++                        d9 = d9 / d13;
++                        // Don't use expensive getSeenPercent (performs raytracing) when the entity to check is another TNT entity. Doesn't make any sense. We just need to explode it.
++                        double d14 = (d12 / 100);
++                        double d10 = (1.0D - d12) * d14;
++//                        entity.hurt(DamageSource.explosion(tntEntity.getOwner()), (float) ((int) ((d10 * d10 + d10) / 2.0D * 7.0D * (double) f2 + 1.0D)));
++                        double d11 = d10;
++                        if (entity instanceof LivingEntity) {
++                            d11 = ProtectionEnchantment.getExplosionKnockbackAfterDampener((LivingEntity) entity, d10);
++                        }
++
++                        entity.setDeltaMovement(entity.getDeltaMovement().add(d5 * d11, d7 * d11, d9 * d11));
++                        if (entity instanceof PlayerEntity) {
++                            PlayerEntity playerentity = (PlayerEntity) entity;
++                            if (!playerentity.isSpectator() && (!playerentity.isCreative() || !playerentity.abilities.flying)) {
++                                hitPlayers.put(playerentity, new Vector3d(d5 * d10, d7 * d10, d9 * d10));
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        return hitPlayers;
++    }
++
++    private static Set<BlockPos> getTNTExplodedBlockPositions(TNTEntity entity) {
++        return OptimizedExplosion.getExplodedBlockPositions(entity.level, entity.getX(), entity.getY(0.0625D), entity.getZ(), 4.0F);
 +    }
 +}
 diff --git a/src/main/java/me/mikex86/velox/tick/debug/MadMaxTickManager.java b/src/main/java/me/mikex86/velox/tick/debug/MadMaxTickManager.java
@@ -328,23 +611,26 @@ index 0000000..0cd9673
 +}
 diff --git a/src/main/java/me/mikex86/velox/tick/global/WorldTickManager.java b/src/main/java/me/mikex86/velox/tick/global/WorldTickManager.java
 new file mode 100644
-index 0000000..f146270
+index 0000000..ea56b99
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/tick/global/WorldTickManager.java
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,122 @@
 +package me.mikex86.velox.tick.global;
 +
 +import com.google.common.collect.Maps;
 +import com.google.common.collect.Queues;
 +import me.mikex86.velox.tick.region.RegionTickManager;
++import me.mikex86.veloxapi.game.GameTick;
 +import me.mikex86.veloxapi.threading.WorldThreadGuard;
 +import net.minecraft.world.World;
 +import org.jetbrains.annotations.NotNull;
 +import org.jetbrains.annotations.Nullable;
 +
++import java.util.Iterator;
 +import java.util.Map;
 +import java.util.Optional;
 +import java.util.Queue;
++import java.util.function.Supplier;
 +
 +/**
 + * Grants global synchronized access without concurrent interference to the global state of a world.
@@ -392,13 +678,19 @@ index 0000000..f146270
 +
 +        grantCurrentThreadAccess(world);
 +        Queue<Runnable> taskQueue = getTaskQueue(worldId);
-+        while (!taskQueue.isEmpty()) {
-+            taskQueue.remove().run();
++        Iterator<Runnable> iterator = taskQueue.iterator();
++        while (iterator.hasNext()) {
++            Runnable runnable = iterator.next();
++            runnable.run();
++            if (runnable instanceof RepeatingTaskRunnable<?> && !((RepeatingTaskRunnable<?>) runnable).getRepeatingTask().isCancelled()) {
++                continue; // do not remove if the runnable is a repeating task and it is not cancelled
++            }
++            iterator.remove();
 +        }
 +        revokeThreadAccess(world);
 +    }
 +
-+    public static boolean hasThreadGlobalMutationAccess(WorldThreadGuard<? extends World> world, Thread thread) {
++    public static boolean hasThreadGlobalMutationAccess(@NotNull WorldThreadGuard<? extends World> world, @NotNull Thread thread) {
 +        return threadAccessMap.get(world.getWorldId()).orElse(null) == thread;
 +    }
 +
@@ -406,13 +698,51 @@ index 0000000..f146270
 +    public static RegionTickManager getWorldRegionTickManager(int worldId) {
 +        return tickRegionManagers.get(worldId);
 +    }
++
++
++    public static void scheduleRepeatingTask(@NotNull World world, @NotNull GameTick.RepeatingTask<World> repeatingTask) {
++        runGlobalTask(world, RepeatingTaskRunnable.make(repeatingTask, () -> world));
++    }
++
++    public static void scheduleRepeatingTask(@NotNull WorldThreadGuard<? extends World> world, @NotNull GameTick.RepeatingTask<World> repeatingTask) {
++        runGlobalTask(world, RepeatingTaskRunnable.make(repeatingTask, world::getValue));
++    }
++
++    private static class RepeatingTaskRunnable<T> implements Runnable {
++
++        @NotNull
++        private final GameTick.RepeatingTask<T> repeatingTask;
++
++        @NotNull
++        private final Supplier<T> parameterValueSupplier;
++
++        private RepeatingTaskRunnable(@NotNull GameTick.RepeatingTask<T> repeatingTask, @NotNull Supplier<T> parameterValueSupplier) {
++            this.repeatingTask = repeatingTask;
++            this.parameterValueSupplier = parameterValueSupplier;
++        }
++
++        @Override
++        public void run() {
++            this.repeatingTask.accept(this.parameterValueSupplier.get());
++        }
++
++        @NotNull
++        public static <T> RepeatingTaskRunnable<T> make(@NotNull GameTick.RepeatingTask<T> repeatingTask, @NotNull Supplier<T> parameterValueSupplier) {
++            return new RepeatingTaskRunnable<>(repeatingTask, parameterValueSupplier);
++        }
++
++        @NotNull
++        public GameTick.RepeatingTask<T> getRepeatingTask() {
++            return repeatingTask;
++        }
++    }
 +}
 diff --git a/src/main/java/me/mikex86/velox/tick/region/RegionTickManager.java b/src/main/java/me/mikex86/velox/tick/region/RegionTickManager.java
 new file mode 100644
-index 0000000..f976e70
+index 0000000..8edaf7c
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/tick/region/RegionTickManager.java
-@@ -0,0 +1,534 @@
+@@ -0,0 +1,562 @@
 +package me.mikex86.velox.tick.region;
 +
 +import com.google.common.collect.ImmutableList;
@@ -422,6 +752,7 @@ index 0000000..f976e70
 +import me.mikex86.velox.tick.global.WorldTickManager;
 +import me.mikex86.velox.tick.ticklist.entity.EntityTickList;
 +import me.mikex86.velox.utils.CollectionUtils;
++import me.mikex86.veloxapi.game.GameTick;
 +import me.mikex86.veloxapi.region.Region;
 +import me.mikex86.veloxapi.threading.EntityThreadGuard;
 +import net.minecraft.entity.Entity;
@@ -514,7 +845,7 @@ index 0000000..f976e70
 +            if (newLoadState) {
 +                boolean modified = addChunkToRegion(chunkDstRegion, chunk);
 +                if (!modified) {
-+                    throw new IllegalStateException("Chunk was already contained in it's region before it was even loaded. This should never happen");
++                    System.err.println("Chunk was already contained in it's region before it was even loaded. This should never happen");
 +                }
 +                // Merge bordering regions:
 +                // Checks if "chunk" borders any region that is not its current region.
@@ -531,7 +862,7 @@ index 0000000..f976e70
 +            } else {
 +                boolean modified = chunkDstRegion.removeChunk(chunk);
 +                if (!modified) {
-+                    throw new IllegalStateException("Chunk was already contained in it's region before it was even loaded. This should never happen");
++                    System.err.println("Chunk was never contained in it's region. This should never happen");
 +                }
 +                if (chunkDstRegion.isEmpty()) {
 +                    removeRegion(chunkDstRegion);
@@ -821,24 +1152,51 @@ index 0000000..f976e70
 +    }
 +
 +    /**
++     * Runs the task on all regions in parallel
++     *
++     * @param task the task to run
++     */
++    private void runOnAllRegions(@NotNull Consumer<Region> task) {
++        Collection<Region> regions = regions(); // regions are not weakly consistent in global world task
++        CountDownLatch latch = new CountDownLatch(regions.size());
++        for (Region region : regions) {
++            runAsync(() -> {
++                try {
++                    task.accept(region);
++                } catch (Exception e) {
++                    e.printStackTrace();
++                } finally {
++                    latch.countDown();
++                }
++            });
++        }
++        try {
++            latch.await();
++        } catch (InterruptedException e) {
++            e.printStackTrace();
++        }
++    }
++
++    /**
 +     * Runs a task for all regions as a world global task.
 +     * Task execution is concurrent between regions.
 +     *
 +     * @param task the task runnable that is invoked concurrently with all regions
 +     */
-+    public void runTaskInAllRegions(Consumer<Region> task) {
-+        WorldTickManager.runGlobalTask(this.world, () -> {
-+            Collection<Region> regions = regions(); // regions are not weakly consistent in global world task
-+            CountDownLatch latch = new CountDownLatch(regions.size());
-+            for (Region region : regions) {
-+                runAsync(() -> task.accept(region));
-+            }
-+            try {
-+                latch.await();
-+            } catch (InterruptedException e) {
-+                e.printStackTrace();
-+            }
-+        });
++    public void runTaskInAllRegions(@NotNull Consumer<Region> task) {
++        WorldTickManager.runGlobalTask(this.world, () -> runOnAllRegions(task));
++    }
++
++    /**
++     * Schedules a repeating task for all regions as a world global task.
++     * Task execution is concurrent between regions.
++     * Task is executed until cancelled.
++     *
++     * @param repeatingTask the repeating task
++     */
++    public void scheduleRepeatingTaskInAllRegions(@NotNull GameTick.RepeatingTask<Region> repeatingTask) {
++        GameTick.RepeatingTask<World> worldTask = new GameTick.RepeatingTask<>(world -> runOnAllRegions(repeatingTask));
++        WorldTickManager.scheduleRepeatingTask(this.world, worldTask);
 +    }
 +
 +    /**
@@ -1280,10 +1638,10 @@ index 0000000..9eaca5e
 +}
 diff --git a/src/main/java/me/mikex86/velox/utils/MathUtils.java b/src/main/java/me/mikex86/velox/utils/MathUtils.java
 new file mode 100644
-index 0000000..c457e20
+index 0000000..3ced56b
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/utils/MathUtils.java
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,33 @@
 +package me.mikex86.velox.utils;
 +
 +import static java.lang.Math.floorDiv;
@@ -1294,6 +1652,7 @@ index 0000000..c457e20
 +     * Uses crazy standford magic to round up to the next power of two.
 +     * For zero, it will return back zero again. This is a small anomaly of the function
 +     * for performance reasons.
++     *
 +     * @param n a given number
 +     * @return the next power of two after (or equal to) n
 +     */
@@ -1310,6 +1669,10 @@ index 0000000..c457e20
 +
 +    public static long floorMod(long x, long y) {
 +        return x - floorDiv(x, y) * y;
++    }
++
++    public static int clamp(int value, int low, int high) {
++        return value > high ? high : value < low ? low : value;
 +    }
 +}
 diff --git a/src/main/java/me/mikex86/velox/utils/PeriodicInvoker.java b/src/main/java/me/mikex86/velox/utils/PeriodicInvoker.java
@@ -1482,243 +1845,6 @@ index 0000000..73cb54c
 +
 +    private static int roundUp(int num, int divisor) {
 +        return (num + divisor - 1) / divisor;
-+    }
-+}
-diff --git a/src/main/java/me/mikex86/velox/utils/cache/LossyLongChunkCache.java b/src/main/java/me/mikex86/velox/utils/cache/LossyLongChunkCache.java
-new file mode 100644
-index 0000000..f189c37
---- /dev/null
-+++ b/src/main/java/me/mikex86/velox/utils/cache/LossyLongChunkCache.java
-@@ -0,0 +1,131 @@
-+package me.mikex86.velox.utils.cache;
-+
-+import it.unimi.dsi.fastutil.HashCommon;
-+import me.mikex86.velox.chunk.cache.IChunkCache;
-+import me.mikex86.velox.utils.MathUtils;
-+import net.minecraft.world.chunk.IChunk;
-+
-+import java.util.Arrays;
-+
-+/**
-+ * Implements a chunk cache with a 64-bit key.
-+ * Index collisions of hashes are fairly likely.
-+ * Hash collisions are also not handled.
-+ * Thread-safety is achieved via copy on write
-+ */
-+public class LossyLongChunkCache {
-+
-+    private final int capacity;
-+
-+    /**
-+     * Bit mask used to calculate the index from a key.
-+     */
-+    private final long mask;
-+
-+    /**
-+     * The state of the cache.
-+     * This instance is swapped as a whole when the cache is mutated.
-+     * This copy on write operation constitutes thread-safety
-+     */
-+    private CacheState cacheState;
-+
-+    private final Object mutex = new Object();
-+
-+    /**
-+     * @param capacity the capacity of the cache. Should be a power of two. Next biggest will be used
-+     */
-+    public LossyLongChunkCache(int capacity) {
-+        capacity = MathUtils.npot(capacity);
-+        this.capacity = capacity;
-+        this.mask = capacity - 1;
-+        this.cacheState = new CacheState();
-+    }
-+
-+    public IChunkCache.ChunkCacheEntry get(long key) {
-+        int index = this.index(key);
-+        CacheState cacheState = this.cacheState;
-+        if (cacheState.keys[index] != key) {
-+            return null;
-+        }
-+        IChunkCache.ChunkCacheEntry value = cacheState.values[index];
-+        cacheState.lossyAccessCounters[index]++; // Fuck thread safety here...
-+        return value;
-+    }
-+
-+    private int index(long key) {
-+        return (int) (HashCommon.mix(key) & this.mask);
-+    }
-+
-+    public void clear() {
-+        this.cacheState = new CacheState();
-+    }
-+
-+    public int getCapacity() {
-+        return capacity;
-+    }
-+
-+    public void populate(long[] keys, IChunkCache.ChunkCacheEntry[] values) {
-+        assert keys.length == capacity;
-+        assert values.length == capacity;
-+        synchronized (this.mutex) {
-+            CacheState cacheState = new CacheState();
-+            for (int i = 0; i < keys.length; i++) {
-+                long key = keys[i];
-+                if (key == 0) continue;
-+                int index = this.index(key);
-+                cacheState.keys[index] = key;
-+                cacheState.values[index] = values[i];
-+                cacheState.lossyAccessCounters[index] = 0;
-+            }
-+            this.cacheState = cacheState;
-+        }
-+    }
-+
-+    public void invalidate(long key, IChunk chunk) {
-+        synchronized (this.mutex) {
-+            int index = index(key);
-+            CacheState cacheState = this.cacheState;
-+            IChunkCache.ChunkCacheEntry entry = cacheState.values[index];
-+            if (entry != null && entry.getChunk() == chunk) {
-+                cacheState = cacheState.copy();
-+                cacheState.keys[index] = 0;
-+                cacheState.values[index] = null;
-+                cacheState.lossyAccessCounters[index] = 0;
-+                this.cacheState = cacheState;
-+            }
-+        }
-+    }
-+
-+    private class CacheState {
-+
-+        /**
-+         * Roughly keeps track of the number of accesses each chunk of the cache has.
-+         * We ignore thread-safety. If the counter is slightly off, so be it.
-+         */
-+        private final long[] lossyAccessCounters;
-+
-+        private final long[] keys;
-+
-+        private final IChunkCache.ChunkCacheEntry[] values;
-+
-+        public CacheState() {
-+            this.lossyAccessCounters = new long[capacity];
-+            this.keys = new long[capacity];
-+            this.values = new IChunkCache.ChunkCacheEntry[capacity];
-+        }
-+
-+        public CacheState(long[] lossyAccessCounters, long[] keys, IChunkCache.ChunkCacheEntry[] values) {
-+            this.lossyAccessCounters = lossyAccessCounters;
-+            this.keys = keys;
-+            this.values = values;
-+        }
-+
-+        public CacheState copy() {
-+            return new CacheState(
-+                    Arrays.copyOf(this.lossyAccessCounters, this.lossyAccessCounters.length),
-+                    Arrays.copyOf(this.keys, this.keys.length),
-+                    Arrays.copyOf(this.values, this.values.length)
-+            );
-+        }
-+    }
-+}
-diff --git a/src/main/java/me/mikex86/velox/utils/cache/guava/AccessCountingCache.java b/src/main/java/me/mikex86/velox/utils/cache/guava/AccessCountingCache.java
-new file mode 100644
-index 0000000..06d28a6
---- /dev/null
-+++ b/src/main/java/me/mikex86/velox/utils/cache/guava/AccessCountingCache.java
-@@ -0,0 +1,94 @@
-+package me.mikex86.velox.utils.cache.guava;
-+
-+import com.google.common.cache.Cache;
-+import com.google.common.cache.ForwardingCache;
-+
-+import javax.annotation.Nullable;
-+import java.util.Collections;
-+import java.util.Locale;
-+import java.util.Map;
-+import java.util.WeakHashMap;
-+import java.util.concurrent.Callable;
-+import java.util.concurrent.ConcurrentHashMap;
-+import java.util.concurrent.ExecutionException;
-+import java.util.concurrent.atomic.AtomicInteger;
-+import java.util.concurrent.locks.ReadWriteLock;
-+import java.util.concurrent.locks.ReentrantReadWriteLock;
-+
-+public class AccessCountingCache<K, V> extends ForwardingCache<K, V> {
-+
-+    private final Cache<K, V> delegate;
-+    private final Map<Object, AtomicInteger> accessCounts = new WeakHashMap<>();
-+    private final ReadWriteLock lock = new ReentrantReadWriteLock();
-+
-+    public AccessCountingCache(Cache<K, V> delegate) {
-+        this.delegate = delegate;
-+    }
-+
-+    public static <K, V> AccessCountingCache<K, V> wrap(Cache<K, V> cache) {
-+        return new AccessCountingCache<>(cache);
-+    }
-+
-+    @Override
-+    public V get(K key, Callable<? extends V> valueLoader) throws ExecutionException {
-+        this.lock.readLock().lock();
-+        AtomicInteger integer = this.accessCounts.get(key);
-+        this.lock.readLock().unlock();
-+        if (integer == null) {
-+            integer = new AtomicInteger(0);
-+            this.lock.writeLock().lock();
-+            this.accessCounts.put(key, integer);
-+            this.lock.writeLock().unlock();
-+        }
-+        integer.incrementAndGet();
-+        return super.get(key, valueLoader);
-+    }
-+
-+    @Nullable
-+    @Override
-+    public V getIfPresent(Object key) {
-+        this.lock.readLock().lock();
-+        AtomicInteger integer = this.accessCounts.get(key);
-+        this.lock.readLock().unlock();
-+        if (integer == null) {
-+            integer = new AtomicInteger(0);
-+            this.lock.writeLock().lock();
-+            this.accessCounts.put(key, integer);
-+            this.lock.writeLock().unlock();
-+        }
-+        integer.incrementAndGet();
-+        return super.getIfPresent(key);
-+    }
-+
-+    public void retrieveMostAccessedValues(K[] keys, V[] values) {
-+        int nValues = keys.length;
-+        int[] counters = new int[nValues];
-+        for (Map.Entry<K, V> entry : this.delegate.asMap().entrySet()) {
-+            K key = entry.getKey();
-+            V value = entry.getValue();
-+            this.lock.readLock().lock();
-+            AtomicInteger atomicCounter = this.accessCounts.get(key);
-+            this.lock.readLock().unlock();
-+            int counter = atomicCounter == null ? 0 : atomicCounter.get();
-+            for (int i = 0; i < nValues; i++) {
-+                if (counter >= counters[i]) {
-+                    // Move everything back by one
-+                    for (int j = nValues - 2; j >= i; j--) {
-+                        counters[j + 1] = counters[j];
-+                        keys[j + 1] = keys[j];
-+                        values[j + 1] = values[j];
-+                    }
-+                    counters[i] = counter;
-+                    keys[i] = key;
-+                    values[i] = value;
-+                    break;
-+                }
-+            }
-+        }
-+    }
-+
-+    @Override
-+    protected Cache<K, V> delegate() {
-+        return this.delegate;
 +    }
 +}
 diff --git a/src/main/java/me/mikex86/velox/utils/lock/AbstractLock.java b/src/main/java/me/mikex86/velox/utils/lock/AbstractLock.java
@@ -1939,10 +2065,10 @@ index 0000000..76fb72e
 +}
 diff --git a/src/main/java/me/mikex86/velox/veloxapiimpl/listener/VeloxEventListenerRegistry.java b/src/main/java/me/mikex86/velox/veloxapiimpl/listener/VeloxEventListenerRegistry.java
 new file mode 100644
-index 0000000..813e790
+index 0000000..c6628e0
 --- /dev/null
 +++ b/src/main/java/me/mikex86/velox/veloxapiimpl/listener/VeloxEventListenerRegistry.java
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,86 @@
 +package me.mikex86.velox.veloxapiimpl.listener;
 +
 +import com.google.common.collect.Maps;
@@ -1999,6 +2125,8 @@ index 0000000..813e790
 +    @SuppressWarnings({"unchecked", "rawtypes"})
 +    public <T extends Event> void invokeListeners(Class<T> eventClazz, T event) {
 +        Queue<EventListenerEntry<T>> listenerEntries = (Queue) this.listenerMap.get(eventClazz);
++        if (listenerEntries == null)
++           return;
 +        listenerEntries.parallelStream().forEach(entry -> entry.getEventListener().onEvent(event));
 +    }
 +
@@ -2509,10 +2637,10 @@ index 0000000..d92b0e4
 +}
 diff --git a/src/main/java/me/mikex86/veloxapi/game/GameTick.java b/src/main/java/me/mikex86/veloxapi/game/GameTick.java
 new file mode 100644
-index 0000000..b7ed9ee
+index 0000000..71fcaf7
 --- /dev/null
 +++ b/src/main/java/me/mikex86/veloxapi/game/GameTick.java
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,133 @@
 +package me.mikex86.veloxapi.game;
 +
 +import me.mikex86.velox.tick.global.WorldTickManager;
@@ -2522,6 +2650,7 @@ index 0000000..b7ed9ee
 +import me.mikex86.veloxapi.threading.WorldThreadGuard;
 +import net.minecraft.entity.Entity;
 +import net.minecraft.world.World;
++import org.apache.logging.log4j.util.BiConsumer;
 +import org.jetbrains.annotations.NotNull;
 +
 +import java.util.Objects;
@@ -2566,6 +2695,83 @@ index 0000000..b7ed9ee
 +
 +    public static boolean isThreadAuthorizedForGlobalAccess(@NotNull WorldThreadGuard<? extends World> world, @NotNull Thread thread) {
 +        return WorldTickManager.hasThreadGlobalMutationAccess(world, thread);
++    }
++
++    public static class Scheduler {
++
++        @NotNull
++        public static RepeatingTask<World> scheduleRepeatingTaskInWorld(@NotNull World world, @NotNull BiConsumer<World, RepeatingTask<World>> task) {
++            RepeatingTask<World> repeatingTask = new RepeatingTask<>();
++            repeatingTask.setTask(w -> task.accept(w, repeatingTask));
++            WorldTickManager.scheduleRepeatingTask(world, repeatingTask);
++            return repeatingTask;
++        }
++
++        @NotNull
++        public static RepeatingTask<World> scheduleRepeatingTaskInWorld(@NotNull WorldThreadGuard<? extends World> world, @NotNull BiConsumer<World, RepeatingTask<World>> task) {
++            RepeatingTask<World> repeatingTask = new RepeatingTask<>();
++            repeatingTask.setTask(w -> task.accept(w, repeatingTask));
++            WorldTickManager.scheduleRepeatingTask(world, repeatingTask);
++            return repeatingTask;
++        }
++
++        @NotNull
++        public static RepeatingTask<Region> scheduleRepeatingTaskInAllRegions(@NotNull World world, @NotNull BiConsumer<Region, RepeatingTask<Region>> task) {
++            RepeatingTask<Region> repeatingTask = new RepeatingTask<>();
++            repeatingTask.setTask(region -> task.accept(region, repeatingTask));
++
++            RegionTickManager regionManager = WorldTickManager.getWorldRegionTickManager(world.getWorldId());
++            Objects.requireNonNull(regionManager, "No region manager defined for world id: " + world.getWorldId());
++
++            regionManager.scheduleRepeatingTaskInAllRegions(repeatingTask);
++
++            return repeatingTask;
++        }
++
++
++        @NotNull
++        public static RepeatingTask<Region> scheduleRepeatingTaskInAllRegions(@NotNull WorldThreadGuard<? extends World> world, @NotNull BiConsumer<Region, RepeatingTask<Region>> task) {
++            RepeatingTask<Region> repeatingTask = new RepeatingTask<>();
++            repeatingTask.setTask(region -> task.accept(region, repeatingTask));
++
++            RegionTickManager regionManager = WorldTickManager.getWorldRegionTickManager(world.getWorldId());
++            Objects.requireNonNull(regionManager, "No region manager defined for world id: " + world.getWorldId());
++
++            regionManager.scheduleRepeatingTaskInAllRegions(repeatingTask);
++
++            return repeatingTask;
++        }
++
++    }
++
++    public static class RepeatingTask<T> implements Consumer<T> {
++
++        private Consumer<T> task = null;
++        private boolean cancelled = false;
++
++        public RepeatingTask() {
++        }
++
++        public RepeatingTask(@NotNull Consumer<T> task) {
++            this.task = task;
++        }
++
++        private void setTask(@NotNull Consumer<T> task) {
++            this.task = task;
++        }
++
++        @Override
++        public void accept(T value) {
++            Objects.requireNonNull(this.task, "Repeating task consumer not initialized!").accept(value);
++        }
++
++        public void cancel() {
++            this.cancelled = true;
++        }
++
++        public boolean isCancelled() {
++            return cancelled;
++        }
 +    }
 +}
 diff --git a/src/main/java/me/mikex86/veloxapi/plugin/JvmPlugin.java b/src/main/java/me/mikex86/veloxapi/plugin/JvmPlugin.java
@@ -2825,6 +3031,32 @@ index f4b569e..d0b6792 100644
     }
  
     static enum Mode {
+diff --git a/build/mcp_diff_src/net/minecraft/entity/item/TNTEntity.java b/src/main/java/net/minecraft/entity/item/TNTEntity.java
+index f570fa0..437318c 100644
+--- a/build/mcp_diff_src/net/minecraft/entity/item/TNTEntity.java
++++ b/src/main/java/net/minecraft/entity/item/TNTEntity.java
+@@ -22,6 +22,9 @@ public class TNTEntity extends Entity {
+    @Nullable
+    private LivingEntity owner;
+    private int life = 80;
++   // Velox start: TNTEntity#exploded state
++   public boolean exploded = false;
++   // Velox end
+ 
+    public TNTEntity(EntityType<? extends TNTEntity> p_i50216_1_, World p_i50216_2_) {
+       super(p_i50216_1_, p_i50216_2_);
+@@ -79,8 +82,9 @@ public class TNTEntity extends Entity {
+    }
+ 
+    private void explode() {
+-      float f = 4.0F;
+-      this.level.explode(this, this.getX(), this.getY(0.0625D), this.getZ(), 4.0F, Explosion.Mode.BREAK);
++      // Velox start: set exploded to true on explode()
++      this.exploded = true;
++      // Velox end
+    }
+ 
+    protected void addAdditionalSaveData(CompoundNBT p_213281_1_) {
 diff --git a/build/mcp_diff_src/net/minecraft/entity/player/ServerPlayerEntity.java b/src/main/java/net/minecraft/entity/player/ServerPlayerEntity.java
 index 339b18a..1a31073 100644
 --- a/build/mcp_diff_src/net/minecraft/entity/player/ServerPlayerEntity.java
@@ -3274,6 +3506,64 @@ index 0ba4fdf..cf5f6bd 100644
 +      // Velox end
     }
  }
+diff --git a/build/mcp_diff_src/net/minecraft/util/concurrent/ThreadTaskExecutor.java b/src/main/java/net/minecraft/util/concurrent/ThreadTaskExecutor.java
+index b2dec07..93d4619 100644
+--- a/build/mcp_diff_src/net/minecraft/util/concurrent/ThreadTaskExecutor.java
++++ b/src/main/java/net/minecraft/util/concurrent/ThreadTaskExecutor.java
+@@ -4,6 +4,7 @@ import com.google.common.collect.Queues;
+ import java.util.Queue;
+ import java.util.concurrent.CompletableFuture;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.locks.LockSupport;
+ import java.util.function.BooleanSupplier;
+ import java.util.function.Supplier;
+@@ -16,7 +17,9 @@ public abstract class ThreadTaskExecutor<R extends Runnable> implements ITaskExe
+    private final String name;
+    private static final Logger LOGGER = LogManager.getLogger();
+    private final Queue<R> pendingRunnables = Queues.newConcurrentLinkedQueue();
+-   private int blockingCount;
++   // Velox start: blockingCount atomic
++   private final AtomicInteger blockingCount = new AtomicInteger();
++   // Velox end
+ 
+    protected ThreadTaskExecutor(String p_i50403_1_) {
+       this.name = p_i50403_1_;
+@@ -100,19 +103,21 @@ public abstract class ThreadTaskExecutor<R extends Runnable> implements ITaskExe
+    }
+ 
+    protected boolean pollTask() {
+-      R r = this.pendingRunnables.peek();
++      // Velox start: fix mojang autism. They seem to never have heard of the method poll()
++      R r = this.pendingRunnables.poll();
+       if (r == null) {
+          return false;
+-      } else if (this.blockingCount == 0 && !this.shouldRun(r)) {
++      } else if (this.blockingCount.get() == 0 && !this.shouldRun(r)) {
+          return false;
+       } else {
+-         this.doRunTask(this.pendingRunnables.remove());
++         this.doRunTask(r);
+          return true;
+       }
++      // Velox end
+    }
+ 
+    public void managedBlock(BooleanSupplier p_213161_1_) {
+-      ++this.blockingCount;
++      this.blockingCount.incrementAndGet();
+ 
+       try {
+          while(!p_213161_1_.getAsBoolean()) {
+@@ -121,7 +126,7 @@ public abstract class ThreadTaskExecutor<R extends Runnable> implements ITaskExe
+             }
+          }
+       } finally {
+-         --this.blockingCount;
++         this.blockingCount.decrementAndGet();
+       }
+ 
+    }
 diff --git a/build/mcp_diff_src/net/minecraft/util/palette/PalettedContainer.java b/src/main/java/net/minecraft/util/palette/PalettedContainer.java
 index 929a1e5..401bb26 100644
 --- a/build/mcp_diff_src/net/minecraft/util/palette/PalettedContainer.java
@@ -3826,6 +4116,21 @@ index 2ab06fe..3f91bd9 100644
     }
  }
 +// Velox end
+diff --git a/build/mcp_diff_src/net/minecraft/world/gen/feature/template/TemplateManager.java b/src/main/java/net/minecraft/world/gen/feature/template/TemplateManager.java
+index 4a91012..a42d60d 100644
+--- a/build/mcp_diff_src/net/minecraft/world/gen/feature/template/TemplateManager.java
++++ b/src/main/java/net/minecraft/world/gen/feature/template/TemplateManager.java
+@@ -29,7 +29,9 @@ import org.apache.logging.log4j.Logger;
+ 
+ public class TemplateManager {
+    private static final Logger LOGGER = LogManager.getLogger();
+-   private final Map<ResourceLocation, Template> structureRepository = Maps.newHashMap();
++   // Velox start: structureRepository concurrent
++   private final Map<ResourceLocation, Template> structureRepository = Maps.newConcurrentMap();
++   // Velox end
+    private final DataFixer fixerUpper;
+    private IResourceManager resourceManager;
+    private final Path generatedDir;
 diff --git a/build/mcp_diff_src/net/minecraft/world/raid/RaidManager.java b/src/main/java/net/minecraft/world/raid/RaidManager.java
 index 67b540a..6b3430c 100644
 --- a/build/mcp_diff_src/net/minecraft/world/raid/RaidManager.java
@@ -3842,12 +4147,14 @@ index 67b540a..6b3430c 100644
     private int nextAvailableID;
     private int tick;
 diff --git a/build/mcp_diff_src/net/minecraft/world/server/ChunkManager.java b/src/main/java/net/minecraft/world/server/ChunkManager.java
-index 5ebcd28..44872e8 100644
+index 5ebcd28..840b509 100644
 --- a/build/mcp_diff_src/net/minecraft/world/server/ChunkManager.java
 +++ b/src/main/java/net/minecraft/world/server/ChunkManager.java
-@@ -9,27 +9,19 @@ import com.mojang.datafixers.DataFixer;
+@@ -8,28 +8,21 @@ import com.google.common.collect.Sets;
+ import com.mojang.datafixers.DataFixer;
  import com.mojang.datafixers.util.Either;
  import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
++import it.unimi.dsi.fastutil.ints.Int2ObjectMaps;
  import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 -import it.unimi.dsi.fastutil.longs.Long2ByteMap;
 -import it.unimi.dsi.fastutil.longs.Long2ByteOpenHashMap;
@@ -3877,7 +4184,7 @@ index 5ebcd28..44872e8 100644
  import java.util.function.BooleanSupplier;
  import java.util.function.IntFunction;
  import java.util.function.IntSupplier;
-@@ -37,6 +29,8 @@ import java.util.function.Supplier;
+@@ -37,6 +30,8 @@ import java.util.function.Supplier;
  import java.util.stream.Collectors;
  import java.util.stream.Stream;
  import javax.annotation.Nullable;
@@ -3886,7 +4193,7 @@ index 5ebcd28..44872e8 100644
  import net.minecraft.crash.CrashReport;
  import net.minecraft.crash.CrashReportCategory;
  import net.minecraft.crash.ReportedException;
-@@ -96,8 +90,13 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+@@ -96,8 +91,13 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
     private static final Logger LOGGER = LogManager.getLogger();
     public static final int MAX_CHUNK_DISTANCE = 33 + ChunkStatus.maxDistance();
     private final Long2ObjectLinkedOpenHashMap<ChunkHolder> updatingChunkMap = new Long2ObjectLinkedOpenHashMap<>();
@@ -3901,18 +4208,24 @@ index 5ebcd28..44872e8 100644
     private final LongSet entitiesInLevel = new LongOpenHashSet();
     private final ServerWorld level;
     private final ServerWorldLightManager lightEngine;
-@@ -116,6 +115,10 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+@@ -116,8 +116,14 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
     private final TemplateManager structureManager;
     private final File storageFolder;
     private final PlayerGenerationTracker playerMap = new PlayerGenerationTracker();
-+   // Velox comment:
-+   // #entityMap seems to not be modified during entity tick, as removing and adding entities is
-+   // validated to only happen when entities are not being ticked.
-+   // Concurrent read access should be safe with Velox's ticking model
-    private final Int2ObjectMap<ChunkManager.EntityTracker> entityMap = new Int2ObjectOpenHashMap<>();
-    private final Long2ByteMap chunkTypeCache = new Long2ByteOpenHashMap();
+-   private final Int2ObjectMap<ChunkManager.EntityTracker> entityMap = new Int2ObjectOpenHashMap<>();
+-   private final Long2ByteMap chunkTypeCache = new Long2ByteOpenHashMap();
++
++   // Velox start: entityMap synchronized
++   private final Int2ObjectMap<ChunkManager.EntityTracker> entityMap = Int2ObjectMaps.synchronize(new Int2ObjectOpenHashMap<>());
++   // Velox end
++
++   // Velox start: chunkTypeCache synchronized
++   private final Long2ByteMap chunkTypeCache = Long2ByteMaps.synchronize(new Long2ByteOpenHashMap());
++   // Velox end
     private final Queue<Runnable> unloadQueue = Queues.newConcurrentLinkedQueue();
-@@ -320,6 +323,7 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+    private int viewDistance;
+ 
+@@ -320,6 +326,7 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
     protected void saveAllChunks(boolean p_219177_1_) {
        if (p_219177_1_) {
           List<ChunkHolder> list = this.visibleChunkMap.values().stream().filter(ChunkHolder::wasAccessibleSinceLastSave).peek(ChunkHolder::refreshAccessibility).collect(Collectors.toList());
@@ -3920,7 +4233,7 @@ index 5ebcd28..44872e8 100644
           MutableBoolean mutableboolean = new MutableBoolean();
  
           do {
-@@ -407,7 +411,6 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+@@ -407,7 +414,6 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
                    Chunk chunk = (Chunk)p_219185_5_;
                    this.level.unload(chunk);
                 }
@@ -3928,7 +4241,7 @@ index 5ebcd28..44872e8 100644
                 this.lightEngine.updateChunkStatus(p_219185_5_.getPos());
                 this.lightEngine.tryScheduleUpdate();
                 this.progressListener.onStatusChange(p_219185_5_.getPos(), (ChunkStatus)null);
-@@ -762,13 +765,19 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+@@ -762,13 +768,19 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
     }
  
     protected Iterable<ChunkHolder> getChunks() {
@@ -3950,7 +4263,7 @@ index 5ebcd28..44872e8 100644
           ChunkPos chunkpos = new ChunkPos(entry.getLongKey());
           ChunkHolder chunkholder = entry.getValue();
           Optional<IChunk> optional = Optional.ofNullable(chunkholder.getLastAvailable());
-@@ -851,84 +860,84 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+@@ -851,84 +863,84 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
        return sectionpos;
     }
  
@@ -4078,7 +4391,7 @@ index 5ebcd28..44872e8 100644
  
     public Stream<ServerPlayerEntity> getPlayers(ChunkPos p_219097_1_, boolean p_219097_2_) {
        return this.playerMap.getPlayers(p_219097_1_.toLong()).filter((p_219192_3_) -> {
-@@ -1082,7 +1091,9 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
+@@ -1082,7 +1094,9 @@ public class ChunkManager extends ChunkLoader implements ChunkHolder.IPlayerProv
        private final Entity entity;
        private final int range;
        private SectionPos lastSectionPos;
@@ -4106,9 +4419,20 @@ index c17fea8..3e777f3 100644
     private boolean visible = true;
  
 diff --git a/build/mcp_diff_src/net/minecraft/world/server/ServerChunkProvider.java b/src/main/java/net/minecraft/world/server/ServerChunkProvider.java
-index f0207fb..0dcd774 100644
+index f0207fb..721ae5d 100644
 --- a/build/mcp_diff_src/net/minecraft/world/server/ServerChunkProvider.java
 +++ b/src/main/java/net/minecraft/world/server/ServerChunkProvider.java
+@@ -6,9 +6,9 @@ import com.mojang.datafixers.DataFixer;
+ import com.mojang.datafixers.util.Either;
+ import java.io.File;
+ import java.io.IOException;
+-import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.List;
++import java.util.Objects;
+ import java.util.Optional;
+ import java.util.concurrent.CompletableFuture;
+ import java.util.concurrent.Executor;
 @@ -59,9 +59,7 @@ public class ServerChunkProvider extends AbstractChunkProvider {
     private long lastInhabitedUpdate;
     private boolean spawnEnemies = true;
@@ -4128,7 +4452,7 @@ index f0207fb..0dcd774 100644
     }
  
     public ServerWorldLightManager getLightEngine() {
-@@ -93,97 +90,101 @@ public class ServerChunkProvider extends AbstractChunkProvider {
+@@ -93,97 +90,61 @@ public class ServerChunkProvider extends AbstractChunkProvider {
        return this.chunkMap.getTickingGenerated();
     }
  
@@ -4178,27 +4502,13 @@ index f0207fb..0dcd774 100644
 -         });
 -         this.storeInCache(i, ichunk1, p_212849_3_);
 -         return ichunk1;
+-      }
 +      // Velox start: remove getChunk mainThread check
 +      IProfiler iprofiler = this.level.getProfiler();
 +      iprofiler.incrementCounter("getChunk");
 +      // Velox start: Lookup chunk cache
 +      long packedChunkPos = ChunkPos.asLong(p_212849_1_, p_212849_2_);
-+      IChunk chunk = lookupChunkCache(packedChunkPos, p_212849_3_, p_212849_4_);
-+      if (chunk != null) {
-+         return chunk;
-       }
-+      // Velox end
-+      iprofiler.incrementCounter("getChunkCacheMiss");
-+
-+      // Velox start: invoke fallbackLookup
-+      IChunk ichunk1 = this.fallbackLookup(p_212849_1_, p_212849_2_, p_212849_3_, p_212849_4_);
-+      // Velox end
-+
-+      // Velox start: populate chunk cache
-+      if (ichunk1 != null)
-+         this.populateChunkCache(p_212849_1_, p_212849_2_, ichunk1, p_212849_3_, p_212849_4_);
-+      // Velox end
-+      return ichunk1;
++      return getChunk(packedChunkPos, p_212849_3_, p_212849_4_);
 +      // Velox end
     }
  
@@ -4207,20 +4517,15 @@ index f0207fb..0dcd774 100644
 -      if (Thread.currentThread() != this.mainThread) {
 +      // Velox start: remove getChunkNow mainThread check
 +      this.level.getProfiler().incrementCounter("getChunkNow");
-+      long i = ChunkPos.asLong(p_225313_1_, p_225313_2_);
 +
 +      // Velox start: Lookup chunk cache
 +      long packedChunkPos = ChunkPos.asLong(p_225313_1_, p_225313_2_);
-+      IChunk chunk = lookupChunkCache(packedChunkPos, ChunkStatus.FULL, true);
-+      if (chunk != null) {
-+         return chunk instanceof Chunk ? (Chunk) chunk : null;
-+      }
-+      // Velox end
-+
-+      ChunkHolder chunkholder = this.getVisibleChunkIfPresent(i);
-+      if (chunkholder == null) {
++      IChunk chunk = getChunk(packedChunkPos, ChunkStatus.FULL, true);
++      if (chunk instanceof Chunk)
++         return (Chunk) chunk;
++      else
           return null;
-       } else {
+-      } else {
 -         this.level.getProfiler().incrementCounter("getChunkNow");
 -         long i = ChunkPos.asLong(p_225313_1_, p_225313_2_);
 -
@@ -4230,12 +4535,23 @@ index f0207fb..0dcd774 100644
 -               return ichunk instanceof Chunk ? (Chunk)ichunk : null;
 -            }
 -         }
--
++      // Velox end
++   }
+ 
 -         ChunkHolder chunkholder = this.getVisibleChunkIfPresent(i);
 -         if (chunkholder == null) {
-+         Either<IChunk, ChunkHolder.IChunkLoadingError> either = chunkholder.getFutureIfPresent(ChunkStatus.FULL).getNow((Either<IChunk, ChunkHolder.IChunkLoadingError>)null);
-+         if (either == null) {
-             return null;
+-            return null;
++   // Velox start: fallbackLookup
++   @Nullable
++   protected IChunk fallbackLookup(int chunkX, int chunkZ, ChunkStatus requiredStatus, boolean load) {
++      CompletableFuture<Either<IChunk, ChunkHolder.IChunkLoadingError>> completablefuture = this.getChunkFutureMainThread(chunkX, chunkZ, requiredStatus, load);
++      this.mainThreadProcessor.managedBlock(completablefuture::isDone);
++
++      return completablefuture.join().map((p_222874_0_) -> {
++         return p_222874_0_;
++      }, (p_222870_1_) -> {
++         if (load) {
++            throw (IllegalStateException)Util.pauseInIde(new IllegalStateException("Chunk not there when requested: " + p_222870_1_));
           } else {
 -            Either<IChunk, ChunkHolder.IChunkLoadingError> either = chunkholder.getFutureIfPresent(ChunkStatus.FULL).getNow((Either<IChunk, ChunkHolder.IChunkLoadingError>)null);
 -            if (either == null) {
@@ -4247,47 +4563,20 @@ index f0207fb..0dcd774 100644
 -                  if (ichunk1 instanceof Chunk) {
 -                     return (Chunk)ichunk1;
 -                  }
-+            IChunk ichunk1 = either.left().orElse((IChunk)null);
-+            if (ichunk1 != null) {
-+                // Velox start: Populate chunk cache
-+                this.populateChunkCache(p_225313_1_, p_225313_2_, ichunk1, ChunkStatus.FULL, true);
-+                // Velox end
-+                if (ichunk1 instanceof Chunk) {
-+                  return (Chunk)ichunk1;
-                }
+-               }
 -
 -               return null;
-             }
-+
+-            }
 +            return null;
           }
-       }
-+      // Velox end
-+   }
-+
-+   // Velox start: fallbackLookup
-+   protected IChunk fallbackLookup(int chunkX, int chunkZ, ChunkStatus requiredStatus, boolean load) {
-+      CompletableFuture<Either<IChunk, ChunkHolder.IChunkLoadingError>> completablefuture = this.getChunkFutureMainThread(chunkX, chunkZ, requiredStatus, load);
-+      this.mainThreadProcessor.managedBlock(completablefuture::isDone);
-+      return completablefuture.join().map((p_222874_0_) -> {
-+         return p_222874_0_;
-+      }, (p_222870_1_) -> {
-+         if (load) {
-+            throw (IllegalStateException)Util.pauseInIde(new IllegalStateException("Chunk not there when requested: " + p_222870_1_));
-+         } else {
-+            return null;
-+         }
+-      }
 +      });
 +   }
 +   // Velox end
 +
-+   // Velox start: Expose populateChunkCache to implement chunk cache
-+   protected void populateChunkCache(int chunkX, int chunkZ, IChunk chunk, ChunkStatus requiredStatus, boolean load) {
-+   }
-+   // Velox end
-+
 +   // Velox start: Expose lookupChunkCache to implement chunk cache
-+   protected IChunk lookupChunkCache(long packedChunkPos, ChunkStatus requiredStatus, boolean load) {
++   @Nullable
++   protected IChunk getChunk(long packedChunkPos, ChunkStatus requiredStatus, boolean load) {
 +      return null;
     }
 +   // Velox end
@@ -4529,7 +4818,7 @@ index a78bb2e..43e65d5 100644
     }
  }
 diff --git a/build/mcp_diff_src/net/minecraft/world/server/ServerWorld.java b/src/main/java/net/minecraft/world/server/ServerWorld.java
-index 7120174..c46d616 100644
+index 7120174..c6e4509 100644
 --- a/build/mcp_diff_src/net/minecraft/world/server/ServerWorld.java
 +++ b/src/main/java/net/minecraft/world/server/ServerWorld.java
 @@ -9,11 +9,11 @@ import com.google.common.collect.Sets;
@@ -4547,18 +4836,28 @@ index 7120174..c46d616 100644
  import java.io.IOException;
  import java.io.Writer;
  import java.nio.file.Files;
-@@ -35,6 +35,10 @@ import java.util.stream.Collectors;
+@@ -35,6 +35,12 @@ import java.util.stream.Collectors;
  import java.util.stream.Stream;
  import javax.annotation.Nonnull;
  import javax.annotation.Nullable;
 +
++import me.mikex86.velox.chunk.ConcurrentChunkProvider;
++import me.mikex86.velox.optimizedtnt.OptimizedTnt;
 +import me.mikex86.velox.tick.debug.MadMaxTickManager;
 +import me.mikex86.velox.tick.global.WorldTickManager;
 +import me.mikex86.velox.tick.ticklist.block.ConcurrentTickList;
  import net.minecraft.block.Block;
  import net.minecraft.block.BlockEventData;
  import net.minecraft.block.BlockState;
-@@ -146,10 +150,18 @@ import org.apache.logging.log4j.Logger;
+@@ -49,6 +55,7 @@ import net.minecraft.entity.MobEntity;
+ import net.minecraft.entity.boss.dragon.EnderDragonEntity;
+ import net.minecraft.entity.boss.dragon.EnderDragonPartEntity;
+ import net.minecraft.entity.effect.LightningBoltEntity;
++import net.minecraft.entity.item.TNTEntity;
+ import net.minecraft.entity.merchant.IReputationTracking;
+ import net.minecraft.entity.merchant.IReputationType;
+ import net.minecraft.entity.passive.AnimalEntity;
+@@ -146,10 +153,18 @@ import org.apache.logging.log4j.Logger;
  public class ServerWorld extends World implements ISeedReader {
     public static final BlockPos END_SPAWN_POINT = new BlockPos(100, 50, 0);
     private static final Logger LOGGER = LogManager.getLogger();
@@ -4581,7 +4880,7 @@ index 7120174..c46d616 100644
     private final ServerChunkProvider chunkSource;
     boolean tickingEntities;
     private final MinecraftServer server;
-@@ -158,15 +170,23 @@ public class ServerWorld extends World implements ISeedReader {
+@@ -158,15 +173,23 @@ public class ServerWorld extends World implements ISeedReader {
     private boolean allPlayersSleeping;
     private int emptyTime;
     private final Teleporter portalForcer;
@@ -4609,19 +4908,20 @@ index 7120174..c46d616 100644
     private boolean handlingTick;
     private final List<ISpecialSpawner> customSpawners;
     @Nullable
-@@ -180,9 +200,11 @@ public class ServerWorld extends World implements ISeedReader {
+@@ -180,9 +203,11 @@ public class ServerWorld extends World implements ISeedReader {
        this.server = p_i241885_1_;
        this.customSpawners = p_i241885_12_;
        this.serverLevelData = p_i241885_4_;
+-      this.chunkSource = new ServerChunkProvider(this, p_i241885_3_, p_i241885_1_.getFixerUpper(), p_i241885_1_.getStructureManager(), p_i241885_2_, p_i241885_8_, p_i241885_1_.getPlayerList().getViewDistance(), p_i241885_1_.forceSynchronousWrites(), p_i241885_7_, () -> {
 +      // Velox start: Use ConcurrentChunkProvider
-       this.chunkSource = new ServerChunkProvider(this, p_i241885_3_, p_i241885_1_.getFixerUpper(), p_i241885_1_.getStructureManager(), p_i241885_2_, p_i241885_8_, p_i241885_1_.getPlayerList().getViewDistance(), p_i241885_1_.forceSynchronousWrites(), p_i241885_7_, () -> {
++      this.chunkSource = new ConcurrentChunkProvider(this, p_i241885_3_, p_i241885_1_.getFixerUpper(), p_i241885_1_.getStructureManager(), p_i241885_2_, p_i241885_8_, p_i241885_1_.getPlayerList().getViewDistance(), p_i241885_1_.forceSynchronousWrites(), p_i241885_7_, () -> {
           return p_i241885_1_.overworld().getDataStorage();
        });
 +      // Velox end
        this.portalForcer = new Teleporter(this);
        this.updateSkyBrightness();
        this.prepareWeather();
-@@ -344,75 +366,120 @@ public class ServerWorld extends World implements ISeedReader {
+@@ -344,75 +369,124 @@ public class ServerWorld extends World implements ISeedReader {
        }
  
        if (flag3 || this.emptyTime++ < 300) {
@@ -4735,10 +5035,11 @@ index 7120174..c46d616 100644
 +            // TODO: MAD MAX MODE PLUGIN TASK SUPPORT?
 +            MadMaxTickManager.tickMadMax(this.entitiesById.values(), this::tickEntity);
 +         } else {
-+            // build tick list. Predicate: entity.getVehicle() is null.
++            // build tick list.
 +            // Passengers are ticked after main entity tick in #tickNonPassenger.
-+            // Avoid double ticking passengers.
-+            this.regionTickManager.buildEntityTickList(this.entitiesById.values().iterator(), entity -> entity.getVehicle() == null);
++            // 1. Avoid double ticking passengers.
++            // 2. Do not tick TNTEntities here, TNT entities are ticked separately
++            this.regionTickManager.buildEntityTickList(this.entitiesById.values().iterator(), entity -> entity.getVehicle() == null && !(entity instanceof TNTEntity));
 +
 +            // Run Global world tick tasks.
 +            // The region tick list is built when they run, but no state mutation to the world is happening. Important!
@@ -4747,6 +5048,9 @@ index 7120174..c46d616 100644
 +
 +            // tick entities
 +            this.regionTickManager.applyEntityTask(this::tickEntity);
++
++            // tick tnt
++            OptimizedTnt.performExplosions(this.entitiesById.values());
 +         }
 +      }
 +      // remove all entities marked for removal from the entity lists (server global, chunk local, invoke listeners etc...)
@@ -4792,7 +5096,7 @@ index 7120174..c46d616 100644
  
     protected void tickTime() {
        if (this.tickTime) {
-@@ -1019,7 +1086,9 @@ public class ServerWorld extends World implements ISeedReader {
+@@ -1019,7 +1093,9 @@ public class ServerWorld extends World implements ISeedReader {
  
     private void runBlockEvents() {
        while(!this.blockEvents.isEmpty()) {
@@ -4803,7 +5107,7 @@ index 7120174..c46d616 100644
           if (this.doBlockEvent(blockeventdata)) {
              this.server.getPlayerList().broadcast((PlayerEntity)null, (double)blockeventdata.getPos().getX(), (double)blockeventdata.getPos().getY(), (double)blockeventdata.getPos().getZ(), 64.0D, this.dimension(), new SBlockActionPacket(blockeventdata.getPos(), blockeventdata.getBlock(), blockeventdata.getParamA(), blockeventdata.getParamB()));
           }
-@@ -1410,4 +1479,16 @@ public class ServerWorld extends World implements ISeedReader {
+@@ -1410,4 +1486,16 @@ public class ServerWorld extends World implements ISeedReader {
           p_241121_0_.setBlockAndUpdate(p_241122_1_, Blocks.OBSIDIAN.defaultBlockState());
        });
     }
